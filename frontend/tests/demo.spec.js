@@ -11,9 +11,11 @@ async function register(page, email = firstEmail, { sample = false } = {}) {
   await page.getByLabel('E-mail').fill(email);
   await page.getByLabel('Senha').fill(password);
   await page.getByRole('button', { name: 'Criar conta' }).click();
-  await page.getByLabel('Nome da empresa').fill(email === firstEmail ? 'Empresa Sintética A' : 'Empresa Sintética B');
+  const company = email === firstEmail ? 'Empresa Sintética A' : 'Empresa Sintética B';
+  await page.getByLabel('Nome da empresa').fill(company);
   await page.getByLabel('Incluir cenário sintético').setChecked(sample);
   await page.getByRole('button', { name: 'Salvar e continuar' }).click();
+  await expect(page.getByText(company, { exact: true })).toBeVisible();
 }
 
 async function login(page, email = firstEmail) {
@@ -44,7 +46,6 @@ function summary(page, label) {
 test('MVP no celular com revisão, três formatos, baixa, reenvio e retorno pelo lembrete', async ({ page }) => {
   await page.goto('/');
   await register(page);
-  await expect(page.getByRole('heading', { name: 'Visão geral' })).toBeVisible();
   await expect(page.getByText('Sem histórico de caixa')).toBeVisible();
 
   const unknown = [...headers];
@@ -104,6 +105,19 @@ test('MVP no celular com revisão, três formatos, baixa, reenvio e retorno pelo
   await expect(page.getByText('Ficha indisponível', { exact: true })).toBeVisible();
   await go(page, 'Importações');
   await expect(page.getByText('Nenhuma importação')).toBeVisible();
+
+  const secondCompany = [headers, row('B-01', { client: 'Cliente da Empresa B' })];
+  await upload(page, spreadsheet('csv', secondCompany, 'empresa-b'));
+  await expect(summary(page, 'Novos')).toHaveText('1');
+  await go(page, 'Carteira');
+  await expect(page.getByRole('link', { name: 'Cliente da Empresa B' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Cliente Sintético' })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Sair', exact: true }).click();
+  await login(page);
+  await go(page, 'Importações');
+  await expect(page.getByRole('link', { name: 'reenvio.xls' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'empresa-b.csv' })).toHaveCount(0);
 });
 
 test('carteira, cobrança editável, Kanban, acordo e promessa', async ({ page }) => {

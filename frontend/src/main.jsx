@@ -104,7 +104,6 @@ const navigation = [
 
 function Layout({ session, onSession }) {
   const { error, busy, run } = useAction();
-  const navigate = useNavigate();
   return <div className="app-shell">
     <a className="skip" href="#conteudo">Ir para o conteúdo</a>
     <aside className="sidebar">
@@ -115,7 +114,6 @@ function Layout({ session, onSession }) {
         <button type="button" className="secondary" disabled={busy} onClick={() => run(async () => {
           await api.logout();
           onSession(null);
-          navigate('/entrar', { replace: true });
         })}>Sair</button>
       </div>
     </aside>
