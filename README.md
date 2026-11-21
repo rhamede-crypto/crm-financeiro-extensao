@@ -7,6 +7,10 @@ Projeto de extensão para pequenos negócios. O MVP importa planilhas financeira
 | Front-end | Rhámede (`rhamede-crypto`) | React e consumo da API REST |
 | Back-end | Nicolas (`Niconfisk`) | Python, Django REST, PostgreSQL, Docker, Celery e Redis |
 
+## Executar o front-end
+
+O React fica em [`frontend/`](frontend/README.md). Execute `npm ci` e `npm run dev` nessa pasta para abrir a demonstração com dados sintéticos. A documentação do front-end detalha a configuração da API, os testes e a validação pendente com o Django.
+
 ## Primeira entrega
 
 1. Rhámede começa pela [FE01](../../issues/1), montando a base React e os mocks.
