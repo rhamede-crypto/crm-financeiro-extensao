@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.db import models
+
+from core.domain.exceptions import TenantAccessDeniedError
+from core.domain.value_objects import ImportStatus, ImportType
 
 
 class UserManager(BaseUserManager["User"]):
@@ -53,3 +57,143 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self) -> str:
         return self.email
+
+
+class Company(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=140)
+    segment = models.CharField(max_length=120, blank=True, default="")
+    tax_regime = models.CharField(max_length=64, blank=True, default="")
+    initial_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "companies"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class CompanyMembership(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="membership",
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    role = models.CharField(max_length=32, default="owner")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "company_memberships"
+
+
+class TenantQuerySet(models.QuerySet):
+    def for_company(self, company_id: uuid.UUID | None) -> TenantQuerySet:
+        if company_id is None:
+            raise TenantAccessDeniedError("Escopo de empresa obrigatório na consulta.")
+        return self.filter(company_id=company_id)
+
+
+class TenantScopedManager(models.Manager):
+    def get_queryset(self) -> TenantQuerySet:
+        return TenantQuerySet(self.model, using=self._db)
+
+    def for_company(self, company_id: uuid.UUID | None) -> TenantQuerySet:
+        return self.get_queryset().for_company(company_id)
+
+
+class TenantScopedModel(models.Model):
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="%(class)ss",
+    )
+
+    objects = TenantScopedManager()
+    unscoped = models.Manager()
+
+    class Meta:
+        abstract = True
+
+
+class StoredImportFile(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    original_filename = models.CharField(max_length=255)
+    storage_key = models.CharField(max_length=512)
+    size_bytes = models.PositiveBigIntegerField()
+    sha256 = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "stored_import_files"
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+
+class ImportJobRecord(TenantScopedModel):
+    STATUS_CHOICES = [(item.value, item.value) for item in ImportStatus]
+    TYPE_CHOICES = [(item.value, item.value) for item in ImportType]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    stored_file = models.ForeignKey(
+        StoredImportFile,
+        on_delete=models.PROTECT,
+        related_name="import_jobs",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.PROTECT,
+        related_name="import_jobs",
+    )
+    import_type = models.CharField(max_length=24, choices=TYPE_CHOICES)
+    filename = models.CharField(max_length=255)
+    status = models.CharField(
+        max_length=24,
+        choices=STATUS_CHOICES,
+        default=ImportStatus.QUEUED.value,
+    )
+    error_message = models.TextField(blank=True, default="")
+    row_count = models.PositiveIntegerField(null=True, blank=True)
+    last_worker_task_id = models.CharField(max_length=128, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "import_jobs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "status"]),
+        ]
+
+
+class IdempotencyRecord(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scope_path = models.CharField(max_length=200)
+    idempotency_key = models.CharField(max_length=128)
+    request_hash = models.CharField(max_length=64)
+    status_code = models.PositiveSmallIntegerField()
+    response_body = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "idempotency_records"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "scope_path", "idempotency_key"],
+                name="uniq_company_scope_idempotency",
+            ),
+        ]

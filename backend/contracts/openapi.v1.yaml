@@ -1,0 +1,833 @@
+openapi: 3.1.0
+info:
+  title: CRM Financeiro de Extensão API
+  version: 1.0.0
+  description: |
+    Contrato REST versionado da API do CRM Financeiro de Extensão.
+
+    Convenções gerais:
+    - **Autenticação e CSRF**: Sessão HTTP via cookie (`SessionAuthentication`). `GET /api/v1/session`
+      inicializa o cookie `csrftoken`. Operações de escrita (`POST`, `PUT`, `PATCH`, `DELETE`) devem enviar
+      `X-CSRFToken`.
+    - **Escopo por empresa (Multi-tenancy)**: Resolvido exclusivamente no servidor a partir do vínculo do
+      usuário autenticado. Payloads de escrita nunca enviam `company_id` (qualquer valor enviado é ignorado).
+      Consultas a IDs de outra empresa retornam `404` para impedir enumeração.
+    - **Dinheiro e datas**: Valores monetários são representados como strings decimais com 2 casas
+      (ex.: `"8450.00"`). Datas civis usam `YYYY-MM-DD` e instantes usam ISO 8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+    - **Idempotência**: Endpoints críticos aceitam `Idempotency-Key` isolado por empresa e rota.
+    - **Estados de importação**: `queued`, `processing`, `review`, `completed`, `failed`, `canceled`.
+servers:
+  - url: /api/v1
+    description: Prefixo padrão configurado em VITE_API_BASE_URL
+tags:
+  - name: Saúde
+  - name: Sessão e Empresa
+  - name: Importações
+  - name: Financeiro
+  - name: CRM e Pipeline
+components:
+  securitySchemes:
+    cookieSession:
+      type: apiKey
+      in: cookie
+      name: sessionid
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRFToken
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+      description: Chave idempotente para evitar duplicidade em retentativas.
+  schemas:
+    MoneyDecimal:
+      type: string
+      pattern: "^-?\\d+\\.\\d{2}$"
+      example: "8450.00"
+    CivilDate:
+      type: string
+      format: date
+      pattern: "^\\d{4}-\\d{2}-\\d{2}$"
+      example: "2026-10-30"
+    ImportStatus:
+      type: string
+      enum:
+        - queued
+        - processing
+        - review
+        - completed
+        - failed
+        - canceled
+    ImportType:
+      type: string
+      enum:
+        - receivable
+        - payable
+        - settled
+    ErrorEnvelope:
+      type: object
+      required: [message, errors]
+      properties:
+        message:
+          type: string
+          example: "Confira os dados informados."
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            email: ["E-mail já cadastrado."]
+        code:
+          type: string
+          example: "validation_error"
+    UserSummary:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+          example: "Pessoa Sintética"
+        email:
+          type: string
+          format: email
+          example: "empresa-a@example.test"
+    CompanySummary:
+      type: object
+      required: [name, segment]
+      properties:
+        name:
+          type: string
+          example: "Empresa Sintética A"
+        segment:
+          type: string
+          example: "comercio_local"
+        taxRegime:
+          type: string
+          example: "simples_nacional"
+        initialBalance:
+          $ref: "#/components/schemas/MoneyDecimal"
+    SessionPayload:
+      type: object
+      required: [user, company]
+      properties:
+        user:
+          $ref: "#/components/schemas/UserSummary"
+        company:
+          oneOf:
+            - $ref: "#/components/schemas/CompanySummary"
+            - type: "null"
+    ImportJob:
+      type: object
+      required: [id, type, filename, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          $ref: "#/components/schemas/ImportType"
+        filename:
+          type: string
+          example: "financeiro.csv"
+        status:
+          $ref: "#/components/schemas/ImportStatus"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-12T12:00:00Z"
+        rowCount:
+          type: integer
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        columns:
+          type: array
+          items:
+            type: object
+            required: [id, label]
+            properties:
+              id: { type: string }
+              label: { type: string }
+        fields:
+          type: array
+          items:
+            type: object
+            required: [id, label]
+            properties:
+              id: { type: string }
+              label: { type: string }
+              required: { type: boolean }
+        mapping:
+          type: object
+          additionalProperties:
+            type: object
+            required: [column, confidence]
+            properties:
+              column: { type: string }
+              confidence: { type: string, enum: [high, low] }
+        preview:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+        ambiguities:
+          type: array
+          items:
+            type: object
+            required: [id, row, description, options]
+            properties:
+              id: { type: string }
+              row: { type: integer }
+              description: { type: string }
+              options:
+                type: array
+                items: { type: string, enum: [new, ignore] }
+        summary:
+          type: object
+          nullable: true
+          properties:
+            created: { type: integer }
+            updated: { type: integer }
+            unchanged: { type: integer }
+            rejected: { type: integer }
+    DashboardPayload:
+      type: object
+      required: [projections, negativeDate, updatedAt, ranking, alerts]
+      properties:
+        projections:
+          type: array
+          items:
+            type: object
+            required: [days, amount]
+            properties:
+              days: { type: integer, enum: [30, 60, 90] }
+              amount: { $ref: "#/components/schemas/MoneyDecimal" }
+          example:
+            - { days: 30, amount: "24500.00" }
+            - { days: 60, amount: "18760.00" }
+            - { days: 90, amount: "-840.00" }
+        negativeDate:
+          oneOf:
+            - $ref: "#/components/schemas/CivilDate"
+            - type: "null"
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        ranking:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            required: [id, name, amount, days]
+            properties:
+              id: { type: string }
+              name: { type: string, example: "Mercado Horizonte" }
+              amount: { $ref: "#/components/schemas/MoneyDecimal" }
+              days: { type: integer, example: 22 }
+        alerts:
+          type: array
+          items:
+            type: object
+            required: [id, supplierId, supplier, category, period, change, recommendation]
+            properties:
+              id: { type: string }
+              supplierId: { type: string }
+              supplier: { type: string, example: "Distribuidora Aurora" }
+              category: { type: string, example: "Embalagens" }
+              period: { type: string, example: "Set–Out 2026" }
+              change: { type: number, example: 21.6 }
+              recommendation: { type: string }
+    ChatResponse:
+      type: object
+      required: [text, references, insufficient]
+      properties:
+        text: { type: string }
+        references:
+          type: array
+          items: { type: string }
+        insufficient: { type: boolean }
+    ReminderPreferences:
+      type: object
+      required: [available, channel, enabled, weekday, lastConsolidated]
+      properties:
+        available: { type: boolean }
+        channel: { type: string, example: "E-mail" }
+        enabled: { type: boolean }
+        weekday:
+          type: string
+          enum: [monday, tuesday, wednesday, thursday, friday, saturday, sunday]
+        lastConsolidated:
+          type: string
+          format: date-time
+          nullable: true
+    ContactListItem:
+      type: object
+      required: [id, name, type]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [customer, supplier] }
+    DealCard:
+      type: object
+      required: [id, contactId, title, name, amount, due, stage, version]
+      properties:
+        id: { type: string }
+        contactId: { type: string }
+        title: { type: string, example: "Fatura F-018" }
+        name: { type: string, example: "Mercado Horizonte" }
+        amount: { $ref: "#/components/schemas/MoneyDecimal" }
+        due: { $ref: "#/components/schemas/CivilDate" }
+        stage:
+          type: string
+          enum: [identified, contacted, negotiating, promised, paid]
+        version: { type: integer, example: 1 }
+paths:
+  /health:
+    get:
+      tags: [Saúde]
+      summary: Verifica disponibilidade da API, banco de dados e fila
+      responses:
+        "200":
+          description: Serviços saudáveis
+        "503":
+          description: Dependência indisponível
+  /session:
+    get:
+      tags: [Sessão e Empresa]
+      summary: Obtém sessão atual e inicializa cookie CSRF
+      responses:
+        "200":
+          description: Sessão ativa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionPayload" }
+        "401":
+          description: Sessão ausente ou expirada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /auth/register:
+    post:
+      tags: [Sessão e Empresa]
+      summary: Cadastra usuário e inicia sessão
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 254 }
+                password: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "201":
+          description: Usuário criado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionPayload" }
+        "422":
+          description: Erro de validação
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /auth/login:
+    post:
+      tags: [Sessão e Empresa]
+      summary: Autentica usuário existente
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: Autenticado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionPayload" }
+        "401":
+          description: Credenciais inválidas
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /auth/logout:
+    post:
+      tags: [Sessão e Empresa]
+      summary: Encerra a sessão atual
+      security: [{ cookieSession: [], csrfToken: [] }]
+      responses:
+        "204":
+          description: Sessão encerrada
+  /company:
+    post:
+      tags: [Sessão e Empresa]
+      summary: Onboarding da empresa do usuário autenticado
+      security: [{ cookieSession: [], csrfToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 140 }
+                segment: { type: string, maxLength: 120 }
+                taxRegime: { type: string, maxLength: 64 }
+                initialBalance: { $ref: "#/components/schemas/MoneyDecimal" }
+      responses:
+        "201":
+          description: Empresa cadastrada e vinculada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionPayload" }
+        "409":
+          description: Empresa já cadastrada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /imports/options:
+    get:
+      tags: [Importações]
+      summary: Limites, formatos e tipos de planilha aceitos
+      security: [{ cookieSession: [] }]
+      responses:
+        "200":
+          description: Configuração de importação
+          content:
+            application/json:
+              example:
+                maxBytes: 5242880
+                maxRows: 10000
+                extensions: [csv, xlsx, xls]
+                types:
+                  - { id: receivable, label: "Contas a receber" }
+                  - { id: payable, label: "Contas a pagar" }
+                  - { id: settled, label: "Lançamentos efetivados" }
+  /imports:
+    get:
+      tags: [Importações]
+      summary: Lista lotes de importação da empresa autenticada
+      security: [{ cookieSession: [] }]
+      responses:
+        "200":
+          description: Lotes pertencentes exclusivamente à empresa da sessão
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImportJob" }
+    post:
+      tags: [Importações]
+      summary: Envia planilha para processamento assíncrono isolado por empresa
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, type]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                type:
+                  $ref: "#/components/schemas/ImportType"
+      responses:
+        "202":
+          description: Lote aceito para fila
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportJob" }
+        "413":
+          description: Arquivo vazio ou acima do limite
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "422":
+          description: Formato ou tipo inválido
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /imports/{id}:
+    get:
+      tags: [Importações]
+      summary: Consulta lote da empresa (retorna 404 para IDs de outra empresa)
+      security: [{ cookieSession: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Estado atual do lote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportJob" }
+        "404":
+          description: Importação não encontrada no escopo da empresa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /imports/{id}/confirm:
+    post:
+      tags: [Importações]
+      summary: Confirma mapeamento e ambiguidades para consolidação
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mapping]
+              properties:
+                mapping:
+                  type: object
+                  additionalProperties: { type: string }
+                resolutions:
+                  type: object
+                  additionalProperties: { type: string, enum: [new, ignore] }
+      responses:
+        "200":
+          description: Resultado da consolidação ou nova revisão
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportJob" }
+  /imports/{id}/cancel:
+    post:
+      tags: [Importações]
+      summary: Cancela lote em revisão da empresa autenticada
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Lote cancelado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportJob" }
+        "404":
+          description: Importação não encontrada no escopo da empresa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: Lote não pode ser cancelado no estado atual
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /dashboard:
+    get:
+      tags: [Financeiro]
+      summary: Projeção 30/60/90 dias, Top 5 inadimplência e alertas de custo
+      security: [{ cookieSession: [] }]
+      responses:
+        "200":
+          description: Indicadores determinísticos da empresa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DashboardPayload" }
+  /chat:
+    post:
+      tags: [Financeiro]
+      summary: Consultoria CEO IA ancorada nos indicadores da empresa
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: { type: string, maxLength: 2000 }
+      responses:
+        "200":
+          description: Resposta fundamentada ou sinalização de dados insuficientes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatResponse" }
+  /reminders:
+    get:
+      tags: [Sessão e Empresa]
+      summary: Obtém preferências de lembrete semanal
+      security: [{ cookieSession: [] }]
+      responses:
+        "200":
+          description: Preferências atuais
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReminderPreferences" }
+    put:
+      tags: [Sessão e Empresa]
+      summary: Atualiza preferências de lembrete semanal
+      security: [{ cookieSession: [], csrfToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled, weekday]
+              properties:
+                enabled: { type: boolean }
+                weekday:
+                  type: string
+                  enum: [monday, tuesday, wednesday, thursday, friday, saturday, sunday]
+      responses:
+        "200":
+          description: Preferências salvas
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReminderPreferences" }
+  /contacts:
+    get:
+      tags: [CRM e Pipeline]
+      summary: Pesquisa carteira de clientes e fornecedores da empresa
+      security: [{ cookieSession: [] }]
+      parameters:
+        - name: query
+          in: query
+          schema: { type: string }
+        - name: type
+          in: query
+          schema: { type: string, enum: [customer, supplier] }
+      responses:
+        "200":
+          description: Contatos da empresa
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ContactListItem" }
+  /contacts/{id}:
+    get:
+      tags: [CRM e Pipeline]
+      summary: Ficha detalhada do cliente ou fornecedor
+      security: [{ cookieSession: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Ficha do contato
+        "404":
+          description: Ficha indisponível no escopo da empresa
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /contacts/{id}/agreements:
+    post:
+      tags: [CRM e Pipeline]
+      summary: Registra acordo de renegociação com fornecedor
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, terms]
+              properties:
+                date: { $ref: "#/components/schemas/CivilDate" }
+                terms: { type: string, maxLength: 3000 }
+                alertId: { type: string, nullable: true }
+      responses:
+        "201":
+          description: Acordo registrado
+  /contacts/{id}/timeline:
+    get:
+      tags: [CRM e Pipeline]
+      summary: Lista notas, promessas e pagamentos do contato
+      security: [{ cookieSession: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Eventos da timeline
+  /contacts/{id}/timeline/notes:
+    post:
+      tags: [CRM e Pipeline]
+      summary: Adiciona nota e retorna sugestão estruturada de promessa quando aplicável
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, maxLength: 3000 }
+      responses:
+        "201":
+          description: Nota salva
+  /contacts/{id}/timeline/{noteId}/confirm:
+    post:
+      tags: [CRM e Pipeline]
+      summary: Confirma promessa sugerida e a aplica na projeção de caixa
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: noteId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, amount, date]
+              properties:
+                title: { type: string, maxLength: 140 }
+                amount: { $ref: "#/components/schemas/MoneyDecimal" }
+                date: { $ref: "#/components/schemas/CivilDate" }
+      responses:
+        "201":
+          description: Promessa confirmada
+  /contacts/{id}/collections/preview:
+    post:
+      tags: [CRM e Pipeline]
+      summary: Gera prévia editável de cobrança no tom selecionado
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tone]
+              properties:
+                tone: { type: string, enum: [friendly, firm, negotiation] }
+      responses:
+        "200":
+          description: Prévia de mensagem ou motivo de indisponibilidade
+  /contacts/{id}/collections/send:
+    post:
+      tags: [CRM e Pipeline]
+      summary: Dispara cobrança confirmada de forma idempotente
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tone, text, channel]
+              properties:
+                tone: { type: string, enum: [friendly, firm, negotiation] }
+                text: { type: string, maxLength: 4000 }
+                channel: { type: string }
+      responses:
+        "200":
+          description: Estado do envio registrado
+  /deals:
+    get:
+      tags: [CRM e Pipeline]
+      summary: Lista cartões de negociação do Kanban da empresa
+      security: [{ cookieSession: [] }]
+      responses:
+        "200":
+          description: Cartões do pipeline
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DealCard" }
+  /deals/{id}:
+    patch:
+      tags: [CRM e Pipeline]
+      summary: Move cartão no Kanban com controle otimista de versão
+      security: [{ cookieSession: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stage, version]
+              properties:
+                stage:
+                  type: string
+                  enum: [identified, contacted, negotiating, promised, paid]
+                version: { type: integer }
+      responses:
+        "200":
+          description: Cartão atualizado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DealCard" }
+        "409":
+          description: Conflito de versão concorrente
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
