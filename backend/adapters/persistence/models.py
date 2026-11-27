@@ -315,6 +315,35 @@ class ReminderDispatchLog(TenantScopedModel):
         ]
 
 
+class CollectionDispatch(TenantScopedModel):
+    STATUS_CHOICES = [("sent", "sent"), ("failed", "failed")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="collection_dispatches",
+    )
+    tone = models.CharField(max_length=24)
+    channel = models.CharField(max_length=32, default="email")
+    recipient = models.CharField(max_length=254)
+    message_text = models.TextField()
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES)
+    reason = models.CharField(max_length=200, blank=True, default="")
+    sent_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="collection_dispatches",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "collection_dispatches"
+        ordering = ["-created_at"]
+
+
 class IdempotencyRecord(TenantScopedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scope_path = models.CharField(max_length=200)

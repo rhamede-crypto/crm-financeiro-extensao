@@ -21,9 +21,11 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from adapters.notifications.email_adapter import DjangoEmailNotificationAdapter
 from adapters.persistence.consolidation import consolidate_import_job
 from adapters.persistence.dashboard_service import build_company_dashboard
 from adapters.persistence.models import (
+    CollectionDispatch,
     Company,
     CompanyMembership,
     Contact,
@@ -59,7 +61,9 @@ from core.domain.value_objects import (
     TaxRegime,
     normalize_ascii_text,
 )
+from core.ports.notifications import NotificationMessage
 from core.services.advisor import answer_financial_question
+from core.services.collections import build_collection_message
 from core.services.customer_metrics import CustomerEntryInput, compute_customer_profile
 from core.services.health import HealthService
 
@@ -67,6 +71,8 @@ from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
 from .serializers import (
     ChatRequestSerializer,
+    CollectionPreviewSerializer,
+    CollectionSendSerializer,
     CompanyOnboardingSerializer,
     ImportConfirmSerializer,
     ImportCreateSerializer,
@@ -567,3 +573,134 @@ class ContactDetailView(APIView):
             payload.update(profile)
 
         return Response(payload, status=status.HTTP_200_OK)
+
+
+def _open_customer_invoices(company: Company, contact: Contact) -> list[dict]:
+    from django.utils import timezone
+
+    db_entries = FinancialEntry.objects.for_company(company.id).filter(contact=contact)
+    profile = compute_customer_profile(
+        entries=[
+            CustomerEntryInput(
+                entry_id=e.reference or str(e.id),
+                entry_date=e.entry_date,
+                due_date=e.due_date,
+                amount=e.amount,
+                paid_amount=e.paid_amount,
+                description=e.description,
+                settled=e.settled,
+            )
+            for e in db_entries
+        ],
+        reference_date=timezone.localdate(),
+    )
+    return profile["invoices"]
+
+
+class CollectionPreviewView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = CollectionPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tone = serializer.validated_data["tone"]
+
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            return Response(
+                {"available": False, "reason": "Canal de e-mail indisponível no momento."},
+                status=status.HTTP_200_OK,
+            )
+        if not contact.email.strip():
+            return Response(
+                {
+                    "available": False,
+                    "reason": "O cliente não possui e-mail cadastrado para cobrança.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        invoices = _open_customer_invoices(request.company, contact)
+        if not invoices:
+            return Response(
+                {"available": False, "reason": "O cliente não possui faturas em aberto."},
+                status=status.HTTP_200_OK,
+            )
+
+        text = build_collection_message(
+            tone=tone,
+            contact_name=contact.name,
+            company_name=request.company.name,
+            invoices=invoices,
+        )
+        return Response(
+            {
+                "available": True,
+                "channel": "E-mail",
+                "channelId": "email",
+                "recipient": contact.email,
+                "text": text,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CollectionSendView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = CollectionSendSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tone = serializer.validated_data["tone"]
+        text = serializer.validated_data["text"]
+
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            raise StateConflictError("Canal de cobrança indisponível.")
+        if not contact.email.strip():
+            raise ValidationDomainError(
+                "Destinatário ausente para o cliente.",
+                fields={"recipient": ["Cadastre um e-mail para enviar cobrança."]},
+            )
+
+        def dispatch() -> tuple[int, dict]:
+            receipt = DjangoEmailNotificationAdapter().send(
+                NotificationMessage(
+                    company_id=request.company.id,
+                    recipient=contact.email,
+                    subject=f"Cobrança — {request.company.name}",
+                    body=text,
+                    channel="email",
+                )
+            )
+            record = CollectionDispatch.objects.create(
+                company_id=request.company.id,
+                contact=contact,
+                tone=tone,
+                channel="email",
+                recipient=contact.email,
+                message_text=text,
+                status=receipt.status,
+                reason=receipt.reason,
+                sent_by=request.user,
+            )
+            return status.HTTP_200_OK, {
+                "id": str(record.id),
+                "status": record.status,
+                "channel": record.channel,
+                "reason": record.reason or None,
+            }
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/contacts/{contact_id}/collections/send",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"tone": tone, "text": text, "channel": "email"},
+            execute=dispatch,
+        )
