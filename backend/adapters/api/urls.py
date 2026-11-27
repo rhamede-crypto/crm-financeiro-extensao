@@ -4,6 +4,7 @@ from django.urls import path
 
 from .views import (
     CompanyOnboardingView,
+    DashboardView,
     HealthView,
     ImportCancelView,
     ImportCollectionView,
@@ -32,4 +33,5 @@ urlpatterns = [
     path("imports/<uuid:job_id>", ImportDetailView.as_view(), name="imports-detail"),
     path("imports/<uuid:job_id>/confirm", ImportConfirmView.as_view(), name="imports-confirm"),
     path("imports/<uuid:job_id>/cancel", ImportCancelView.as_view(), name="imports-cancel"),
+    path("dashboard", DashboardView.as_view(), name="dashboard"),
 ]

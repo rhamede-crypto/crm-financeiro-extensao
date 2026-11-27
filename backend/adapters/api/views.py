@@ -22,6 +22,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from adapters.persistence.consolidation import consolidate_import_job
+from adapters.persistence.dashboard_service import build_company_dashboard
 from adapters.persistence.models import (
     Company,
     CompanyMembership,
@@ -414,3 +415,10 @@ class ImportCancelView(APIView):
         job.status = ImportStatus.CANCELED.value
         job.save(update_fields=["status", "updated_at"])
         return Response(ImportJobSerializer(job).data, status=status.HTTP_200_OK)
+
+
+class DashboardView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        return Response(build_company_dashboard(request.company), status=status.HTTP_200_OK)
