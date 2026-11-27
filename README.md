@@ -11,6 +11,31 @@ Projeto de extensão para pequenos negócios. O MVP importa planilhas financeira
 
 O React fica em [`frontend/`](frontend/README.md). Execute `npm ci` e `npm run dev` nessa pasta para abrir a demonstração com dados sintéticos. A documentação do front-end detalha a configuração da API, os testes e a validação pendente com o Django.
 
+## Executar o back-end
+
+O back-end Django REST fica em `backend/`, estruturado em arquitetura hexagonal (`backend/core/` sem dependências de Django e `backend/adapters/` para API, persistência, fila, arquivos, notificações e IA).
+
+Com Docker:
+
+```sh
+cp .env.example .env
+docker compose up -d --build
+```
+
+A API sobe em `http://127.0.0.1:8000` com:
+
+- Saúde dos serviços: `GET /api/v1/health`
+- Esquema OpenAPI: `GET /api/v1/schema` e `GET /api/v1/docs`
+- Mailpit (SMTP local em desenvolvimento): `http://127.0.0.1:8025`
+
+Testes do núcleo sem Django e suíte completa:
+
+```sh
+cd backend
+pytest tests/unit --noconftest
+pytest
+```
+
 ## Primeira entrega
 
 1. Rhámede começa pela [FE01](../../issues/1), montando a base React e os mocks.

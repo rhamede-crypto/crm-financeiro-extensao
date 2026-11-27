@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+backend/.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+media/
+staticfiles/
+graphify-out/
+*.sqlite3
+*.log
