@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.urls import path
 
 from .views import (
+    ChatView,
     CompanyOnboardingView,
     DashboardView,
     HealthView,
@@ -34,4 +35,5 @@ urlpatterns = [
     path("imports/<uuid:job_id>/confirm", ImportConfirmView.as_view(), name="imports-confirm"),
     path("imports/<uuid:job_id>/cancel", ImportCancelView.as_view(), name="imports-cancel"),
     path("dashboard", DashboardView.as_view(), name="dashboard"),
+    path("chat", ChatView.as_view(), name="chat"),
 ]

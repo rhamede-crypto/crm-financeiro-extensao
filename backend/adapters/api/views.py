@@ -50,11 +50,13 @@ from core.domain.exceptions import (
     ValidationDomainError,
 )
 from core.domain.value_objects import CompanySegment, ImportStatus, MoneyDecimal, TaxRegime
+from core.services.advisor import answer_financial_question
 from core.services.health import HealthService
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
 from .serializers import (
+    ChatRequestSerializer,
     CompanyOnboardingSerializer,
     ImportConfirmSerializer,
     ImportCreateSerializer,
@@ -422,3 +424,29 @@ class DashboardView(APIView):
 
     def get(self, request: Request) -> Response:
         return Response(build_company_dashboard(request.company), status=status.HTTP_200_OK)
+
+
+class ChatView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request) -> Response:
+        serializer = ChatRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        question = serializer.validated_data["question"]
+
+        def reply() -> tuple[int, dict]:
+            dashboard = build_company_dashboard(request.company)
+            answer = answer_financial_question(
+                question=question,
+                dashboard=dashboard,
+                company_name=request.company.name,
+            )
+            return status.HTTP_200_OK, answer
+
+        return run_idempotent(
+            company=request.company,
+            scope_path="/chat",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"question": question},
+            execute=reply,
+        )
