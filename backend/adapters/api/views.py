@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,13 @@ from adapters.persistence.repositories import DjangoCompanyScopeRepository
 from adapters.queue.celery_dispatcher import ScopedCeleryDispatcher
 from adapters.queue.probes import RedisBrokerHealthProbe
 from adapters.storage.local_storage import TenantLocalFileStorage
+from adapters.storage.spreadsheet_reader import (
+    MAX_DATA_ROWS,
+    MAX_UPLOAD_BYTES,
+    SUPPORTED_EXTENSIONS,
+    normalize_import_type,
+    read_spreadsheet_table,
+)
 from core.domain.exceptions import (
     AuthenticationDomainError,
     PayloadTooLargeError,
@@ -262,6 +270,25 @@ class CompanyOnboardingView(APIView):
         return Response(_session_payload(request.user), status=status.HTTP_201_CREATED)
 
 
+class ImportOptionsView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        return Response(
+            {
+                "maxBytes": MAX_UPLOAD_BYTES,
+                "maxRows": MAX_DATA_ROWS,
+                "extensions": list(SUPPORTED_EXTENSIONS),
+                "types": [
+                    {"id": "receivable", "label": "Contas a receber"},
+                    {"id": "payable", "label": "Contas a pagar"},
+                    {"id": "settled", "label": "Lançamentos efetivados"},
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class ImportCollectionView(APIView):
     permission_classes = [HasCompanyScope]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
@@ -271,15 +298,17 @@ class ImportCollectionView(APIView):
         return Response(ImportJobSerializer(jobs, many=True).data, status=status.HTTP_200_OK)
 
     def post(self, request: Request) -> Response:
+        upload_started = time.perf_counter()
         serializer = ImportCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         uploaded = serializer.validated_data["file"]
         raw_bytes = uploaded.read()
-        if not raw_bytes or len(raw_bytes) > 5 * 1024 * 1024:
+        if not raw_bytes or len(raw_bytes) > MAX_UPLOAD_BYTES:
             raise PayloadTooLargeError()
 
-        import_type = serializer.validated_data["type"]
+        import_type = normalize_import_type(serializer.validated_data["type"])
+        read_spreadsheet_table(uploaded.name, raw_bytes)
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
         def create_job() -> tuple[int, dict]:
@@ -297,6 +326,7 @@ class ImportCollectionView(APIView):
                 size_bytes=len(raw_bytes),
                 sha256=sha256,
             )
+            upload_duration_ms = max(1, int((time.perf_counter() - upload_started) * 1000))
             job = ImportJobRecord.objects.create(
                 id=job_id,
                 company_id=request.company.id,
@@ -305,9 +335,10 @@ class ImportCollectionView(APIView):
                 import_type=import_type,
                 filename=uploaded.name,
                 status=ImportStatus.QUEUED.value,
+                upload_duration_ms=upload_duration_ms,
             )
             ScopedCeleryDispatcher().enqueue_company_job(
-                "imports.verify_company_job_scope",
+                "imports.process_import_job",
                 request.company.id,
                 job.id,
             )
