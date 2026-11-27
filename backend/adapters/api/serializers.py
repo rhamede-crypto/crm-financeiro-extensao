@@ -119,3 +119,27 @@ class ChatRequestSerializer(serializers.Serializer):
 class ReminderPreferencesSerializer(serializers.Serializer):
     enabled = serializers.BooleanField()
     weekday = serializers.ChoiceField(choices=[item.value for item in Weekday])
+
+
+class CollectionPreviewSerializer(serializers.Serializer):
+    tone = serializers.ChoiceField(
+        choices=["friendly", "firm", "negotiation"],
+        required=False,
+        default="friendly",
+    )
+
+
+class CollectionSendSerializer(serializers.Serializer):
+    tone = serializers.ChoiceField(
+        choices=["friendly", "firm", "negotiation"],
+        required=False,
+        default="friendly",
+    )
+    text = serializers.CharField(max_length=4000, trim_whitespace=True)
+    channel = serializers.CharField(max_length=64, required=False, default="email")
+
+    def validate_text(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Revise a mensagem antes de enviar.")
+        return cleaned

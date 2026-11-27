@@ -4,6 +4,8 @@ from django.urls import path
 
 from .views import (
     ChatView,
+    CollectionPreviewView,
+    CollectionSendView,
     CompanyOnboardingView,
     ContactDetailView,
     ContactsCollectionView,
@@ -42,4 +44,14 @@ urlpatterns = [
     path("reminders", RemindersView.as_view(), name="reminders"),
     path("contacts", ContactsCollectionView.as_view(), name="contacts-list"),
     path("contacts/<uuid:contact_id>", ContactDetailView.as_view(), name="contacts-detail"),
+    path(
+        "contacts/<uuid:contact_id>/collections/preview",
+        CollectionPreviewView.as_view(),
+        name="collections-preview",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/collections/send",
+        CollectionSendView.as_view(),
+        name="collections-send",
+    ),
 ]
