@@ -143,3 +143,8 @@ class CollectionSendSerializer(serializers.Serializer):
         if not cleaned:
             raise serializers.ValidationError("Revise a mensagem antes de enviar.")
         return cleaned
+
+
+class DealMoveSerializer(serializers.Serializer):
+    stage = serializers.CharField(max_length=24)
+    version = serializers.IntegerField(min_value=1)

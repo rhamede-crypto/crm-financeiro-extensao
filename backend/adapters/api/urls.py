@@ -10,6 +10,8 @@ from .views import (
     ContactDetailView,
     ContactsCollectionView,
     DashboardView,
+    DealDetailView,
+    DealsCollectionView,
     HealthView,
     ImportCancelView,
     ImportCollectionView,
@@ -54,4 +56,6 @@ urlpatterns = [
         CollectionSendView.as_view(),
         name="collections-send",
     ),
+    path("deals", DealsCollectionView.as_view(), name="deals-list"),
+    path("deals/<uuid:deal_id>", DealDetailView.as_view(), name="deals-detail"),
 ]
