@@ -27,6 +27,7 @@ from adapters.persistence.models import (
     Company,
     CompanyMembership,
     Contact,
+    FinancialEntry,
     ImportJobRecord,
     ReminderPreference,
     StoredImportFile,
@@ -59,6 +60,7 @@ from core.domain.value_objects import (
     normalize_ascii_text,
 )
 from core.services.advisor import answer_financial_question
+from core.services.customer_metrics import CustomerEntryInput, compute_customer_profile
 from core.services.health import HealthService
 
 from .idempotency import run_idempotent, tenant_storage_path
@@ -524,21 +526,44 @@ class ContactDetailView(APIView):
         contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
         if contact is None:
             raise ResourceNotFoundError("Ficha indisponível.")
-        return Response(
-            {
-                "id": str(contact.id),
-                "name": contact.name,
-                "type": contact.contact_type,
-                "document": contact.document,
-                "phone": contact.phone,
-                "email": contact.email,
-                "needsReview": contact.needs_review,
-                "reviewReason": contact.review_reason or None,
-                "invoices": [],
-                "history": [],
-                "costHistory": [],
-                "alerts": [],
-                "agreements": [],
-            },
-            status=status.HTTP_200_OK,
-        )
+
+        payload = {
+            "id": str(contact.id),
+            "name": contact.name,
+            "type": contact.contact_type,
+            "document": contact.document,
+            "phone": contact.phone,
+            "email": contact.email,
+            "needsReview": contact.needs_review,
+            "reviewReason": contact.review_reason or None,
+            "invoices": [],
+            "history": [],
+            "costHistory": [],
+            "alerts": [],
+            "agreements": [],
+        }
+
+        if contact.contact_type == "customer":
+            from django.utils import timezone
+
+            db_entries = FinancialEntry.objects.for_company(request.company.id).filter(
+                contact=contact
+            )
+            profile = compute_customer_profile(
+                entries=[
+                    CustomerEntryInput(
+                        entry_id=e.reference or str(e.id),
+                        entry_date=e.entry_date,
+                        due_date=e.due_date,
+                        amount=e.amount,
+                        paid_amount=e.paid_amount,
+                        description=e.description,
+                        settled=e.settled,
+                    )
+                    for e in db_entries
+                ],
+                reference_date=timezone.localdate(),
+            )
+            payload.update(profile)
+
+        return Response(payload, status=status.HTTP_200_OK)
