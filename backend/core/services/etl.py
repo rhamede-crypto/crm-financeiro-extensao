@@ -125,6 +125,9 @@ AUX_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "paid_amount": ("valor pago", "pago parcial", "valor baixado", "amortizado"),
     "unit_name": ("unidade", "un", "unid"),
     "unit_price": ("preco unitario", "valor unitario", "vlr unitario"),
+    "document": ("cnpj", "cpf", "cpf cnpj", "documento contato", "cnpj cpf"),
+    "phone": ("telefone", "celular", "whatsapp", "fone"),
+    "email": ("email", "e mail", "email contato"),
 }
 
 DATE_CELL_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{4})$")
@@ -165,6 +168,9 @@ class NormalizedRow:
     unit_name: str
     unit_price: Decimal | None
     settled: bool
+    party_document: str = ""
+    party_phone: str = ""
+    party_email: str = ""
 
     def equivalence_signature(self) -> tuple[str, str, str, str, str]:
         return (
@@ -487,6 +493,9 @@ def normalize_mapped_rows(
         category = _read_cell(row, aux.get("category"))[:80]
         unit_name = _read_cell(row, aux.get("unit_name"))[:40]
         unit_price = parse_money_decimal(_read_cell(row, aux.get("unit_price")))
+        party_document = _read_cell(row, aux.get("document"))[:32]
+        party_phone = _read_cell(row, aux.get("phone"))[:32]
+        party_email = _read_cell(row, aux.get("email"))[:254].lower()
 
         valid.append(
             NormalizedRow(
@@ -505,6 +514,9 @@ def normalize_mapped_rows(
                 unit_name=unit_name,
                 unit_price=unit_price,
                 settled=settled,
+                party_document=party_document,
+                party_phone=party_phone,
+                party_email=party_email,
             )
         )
 

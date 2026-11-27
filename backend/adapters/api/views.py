@@ -26,6 +26,7 @@ from adapters.persistence.dashboard_service import build_company_dashboard
 from adapters.persistence.models import (
     Company,
     CompanyMembership,
+    Contact,
     ImportJobRecord,
     ReminderPreference,
     StoredImportFile,
@@ -50,7 +51,13 @@ from core.domain.exceptions import (
     StateConflictError,
     ValidationDomainError,
 )
-from core.domain.value_objects import CompanySegment, ImportStatus, MoneyDecimal, TaxRegime
+from core.domain.value_objects import (
+    CompanySegment,
+    ImportStatus,
+    MoneyDecimal,
+    TaxRegime,
+    normalize_ascii_text,
+)
 from core.services.advisor import answer_financial_question
 from core.services.health import HealthService
 
@@ -484,3 +491,54 @@ class RemindersView(APIView):
         pref.weekday = serializer.validated_data["weekday"]
         pref.save(update_fields=["enabled", "weekday", "updated_at"])
         return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)
+
+
+class ContactsCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        query = normalize_ascii_text(request.query_params.get("query", ""))
+        ctype = request.query_params.get("type", "").strip()
+        qs = Contact.objects.for_company(request.company.id)
+        if ctype in {"customer", "supplier"}:
+            qs = qs.filter(contact_type=ctype)
+        if query:
+            qs = qs.filter(normalized_name__icontains=query)
+
+        payload = [
+            {
+                "id": str(contact.id),
+                "name": contact.name,
+                "type": contact.contact_type,
+                "needsReview": contact.needs_review,
+            }
+            for contact in qs
+        ]
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ContactDetailView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+        return Response(
+            {
+                "id": str(contact.id),
+                "name": contact.name,
+                "type": contact.contact_type,
+                "document": contact.document,
+                "phone": contact.phone,
+                "email": contact.email,
+                "needsReview": contact.needs_review,
+                "reviewReason": contact.review_reason or None,
+                "invoices": [],
+                "history": [],
+                "costHistory": [],
+                "alerts": [],
+                "agreements": [],
+            },
+            status=status.HTTP_200_OK,
+        )

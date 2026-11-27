@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
 
-from adapters.persistence.models import Company, FinancialEntry, ImportJobRecord
+from adapters.persistence.models import Company, Contact, FinancialEntry, ImportJobRecord
 from adapters.storage.local_storage import TenantLocalFileStorage
 from core.domain.exceptions import StateConflictError, ValidationDomainError
 from core.domain.value_objects import ImportStatus, normalize_ascii_text
+from core.services.contacts import (
+    ContactCandidate,
+    infer_contact_type,
+    normalize_document,
+    normalize_phone,
+    resolve_contact_match,
+)
 from core.services.etl import (
     CANONICAL_FIELDS,
+    NormalizedRow,
     deduplicate_entries,
     normalize_mapped_rows,
 )
@@ -46,6 +55,147 @@ def validate_confirm_mapping(
     return cleaned
 
 
+def _sync_contacts_for_rows(
+    *,
+    company: Company,
+    rows: list[NormalizedRow],
+) -> dict[int, uuid.UUID]:
+    existing_db = list(Contact.objects.for_company(company.id))
+    candidates: list[ContactCandidate] = [
+        ContactCandidate(
+            id=c.id,
+            contact_type=c.contact_type,
+            name=c.name,
+            normalized_name=c.normalized_name,
+            normalized_document=c.normalized_document,
+            normalized_phone=c.normalized_phone,
+            email=c.email,
+            needs_review=c.needs_review,
+            review_reason=c.review_reason,
+        )
+        for c in existing_db
+    ]
+    db_by_id = {c.id: c for c in existing_db}
+    new_contacts: list[Contact] = []
+    dirty_ids: set[uuid.UUID] = set()
+    row_contact_map: dict[int, uuid.UUID] = {}
+    lookup_cache: dict[tuple[str, str, str, str], uuid.UUID] = {}
+
+    for row in rows:
+        if not row.party_name.strip():
+            continue
+        ctype = infer_contact_type(row.entry_type, row.amount)
+        norm_doc = normalize_document(row.party_document)
+        norm_phone = normalize_phone(row.party_phone)
+        cache_key = (ctype, row.normalized_party, norm_doc, norm_phone)
+        if cache_key in lookup_cache and not row.party_email:
+            row_contact_map[row.row_index] = lookup_cache[cache_key]
+            continue
+
+        outcome = resolve_contact_match(
+            candidates,
+            contact_type=ctype,
+            name=row.party_name,
+            document=row.party_document,
+            phone=row.party_phone,
+        )
+
+        if outcome.flag_existing_review is not None:
+            flagged = outcome.flag_existing_review
+            flagged.needs_review = True
+            flagged.review_reason = outcome.review_reason
+            existing_model = db_by_id.get(flagged.id)
+            if existing_model is not None:
+                existing_model.needs_review = True
+                existing_model.review_reason = outcome.review_reason
+                dirty_ids.add(existing_model.id)
+
+        if outcome.action == "reuse" and outcome.matched_contact is not None:
+            cand = outcome.matched_contact
+            model = db_by_id.get(cand.id)
+            if model is not None:
+                changed = False
+                if norm_doc and not model.normalized_document:
+                    model.document = row.party_document
+                    model.normalized_document = norm_doc
+                    cand.normalized_document = norm_doc
+                    changed = True
+                if norm_phone and not model.normalized_phone:
+                    model.phone = row.party_phone
+                    model.normalized_phone = norm_phone
+                    cand.normalized_phone = norm_phone
+                    changed = True
+                if row.party_email and not model.email:
+                    model.email = row.party_email
+                    cand.email = row.party_email
+                    changed = True
+                if outcome.needs_review and not model.needs_review:
+                    model.needs_review = True
+                    model.review_reason = outcome.review_reason
+                    cand.needs_review = True
+                    cand.review_reason = outcome.review_reason
+                    changed = True
+                if changed:
+                    dirty_ids.add(model.id)
+            row_contact_map[row.row_index] = cand.id
+            lookup_cache[cache_key] = cand.id
+            continue
+
+        new_id = uuid.uuid4()
+        new_model = Contact(
+            id=new_id,
+            company_id=company.id,
+            name=row.party_name.strip()[:160],
+            normalized_name=row.normalized_party[:160],
+            contact_type=ctype,
+            document=row.party_document[:32],
+            normalized_document=norm_doc,
+            phone=row.party_phone[:32],
+            normalized_phone=norm_phone,
+            email=row.party_email[:254],
+            needs_review=outcome.needs_review,
+            review_reason=outcome.review_reason,
+        )
+        new_contacts.append(new_model)
+        db_by_id[new_id] = new_model
+        candidates.append(
+            ContactCandidate(
+                id=new_id,
+                contact_type=ctype,
+                name=new_model.name,
+                normalized_name=new_model.normalized_name,
+                normalized_document=norm_doc,
+                normalized_phone=norm_phone,
+                email=new_model.email,
+                needs_review=outcome.needs_review,
+                review_reason=outcome.review_reason,
+            )
+        )
+        row_contact_map[row.row_index] = new_id
+        lookup_cache[cache_key] = new_id
+
+    if new_contacts:
+        Contact.objects.bulk_create(new_contacts, batch_size=500)
+    created_ids = {c.id for c in new_contacts}
+    to_update = [db_by_id[cid] for cid in dirty_ids if cid not in created_ids]
+    if to_update:
+        Contact.objects.bulk_update(
+            to_update,
+            [
+                "document",
+                "normalized_document",
+                "phone",
+                "normalized_phone",
+                "email",
+                "needs_review",
+                "review_reason",
+                "updated_at",
+            ],
+            batch_size=500,
+        )
+    return row_contact_map
+
+
 def consolidate_import_job(
     *,
     company: Company,
@@ -53,7 +203,7 @@ def consolidate_import_job(
     mapping: dict[str, str],
     resolutions: dict[str, str] | None = None,
 ) -> ImportJobRecord:
-    """Atomically consolidates normalized rows with idempotent deduplication."""
+    """Atomically consolidates normalized rows with deduplication and contact generation."""
     validated_mapping = validate_confirm_mapping(job, mapping)
     storage = TenantLocalFileStorage()
     rows_rel = _relative_from_storage_key(company.id, job.parsed_rows_storage_key)
@@ -130,11 +280,15 @@ def consolidate_import_job(
             )
             return locked_job
 
+        touched_rows = list(dedup.to_create) + [row for _, row in dedup.to_update]
+        row_contact_map = _sync_contacts_for_rows(company=locked_company, rows=touched_rows)
+
         if dedup.to_create:
             new_models = [
                 FinancialEntry(
                     company_id=locked_company.id,
                     import_job=locked_job,
+                    contact_id=row_contact_map.get(row.row_index),
                     entry_type=row.entry_type,
                     reference=row.reference,
                     entry_date=row.entry_date,
@@ -160,6 +314,8 @@ def consolidate_import_job(
             for obj_id, row in dedup.to_update:
                 obj = existing_by_id[obj_id]
                 obj.import_job = locked_job
+                if obj.contact_id is None and row.row_index in row_contact_map:
+                    obj.contact_id = row_contact_map[row.row_index]
                 obj.entry_date = row.entry_date
                 obj.due_date = row.due_date
                 obj.amount = row.amount
@@ -177,6 +333,7 @@ def consolidate_import_job(
                 updated_models,
                 [
                     "import_job",
+                    "contact",
                     "entry_date",
                     "due_date",
                     "amount",

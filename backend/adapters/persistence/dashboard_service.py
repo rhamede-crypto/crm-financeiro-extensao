@@ -52,6 +52,7 @@ def build_company_dashboard(
             amount=e.amount,
             paid_amount=e.paid_amount,
             settled=e.settled,
+            contact_id=str(e.contact_id) if e.contact_id else None,
         )
         for e in db_entries
         if e.entry_type == "receivable"
@@ -71,6 +72,7 @@ def build_company_dashboard(
             party_name=e.party_name,
             normalized_party=e.normalized_party,
             category=e.category,
+            contact_id=str(e.contact_id) if e.contact_id else None,
         )
         for e in db_entries
     ]

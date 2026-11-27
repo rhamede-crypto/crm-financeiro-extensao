@@ -191,6 +191,33 @@ class ImportJobRecord(TenantScopedModel):
         ]
 
 
+class Contact(TenantScopedModel):
+    TYPE_CHOICES = [("customer", "customer"), ("supplier", "supplier")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=160)
+    normalized_name = models.CharField(max_length=160)
+    contact_type = models.CharField(max_length=16, choices=TYPE_CHOICES)
+    document = models.CharField(max_length=32, blank=True, default="")
+    normalized_document = models.CharField(max_length=32, blank=True, default="")
+    phone = models.CharField(max_length=32, blank=True, default="")
+    normalized_phone = models.CharField(max_length=32, blank=True, default="")
+    email = models.EmailField(max_length=254, blank=True, default="")
+    needs_review = models.BooleanField(default=False)
+    review_reason = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "contacts"
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["company", "contact_type", "normalized_document"]),
+            models.Index(fields=["company", "contact_type", "normalized_phone"]),
+            models.Index(fields=["company", "contact_type", "normalized_name"]),
+        ]
+
+
 class FinancialEntry(TenantScopedModel):
     TYPE_CHOICES = [(item.value, item.value) for item in ImportType]
 
@@ -198,6 +225,13 @@ class FinancialEntry(TenantScopedModel):
     import_job = models.ForeignKey(
         ImportJobRecord,
         on_delete=models.PROTECT,
+        related_name="entries",
+    )
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="entries",
     )
     entry_type = models.CharField(max_length=24, choices=TYPE_CHOICES)

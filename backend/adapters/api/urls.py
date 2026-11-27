@@ -5,6 +5,8 @@ from django.urls import path
 from .views import (
     ChatView,
     CompanyOnboardingView,
+    ContactDetailView,
+    ContactsCollectionView,
     DashboardView,
     HealthView,
     ImportCancelView,
@@ -38,4 +40,6 @@ urlpatterns = [
     path("dashboard", DashboardView.as_view(), name="dashboard"),
     path("chat", ChatView.as_view(), name="chat"),
     path("reminders", RemindersView.as_view(), name="reminders"),
+    path("contacts", ContactsCollectionView.as_view(), name="contacts-list"),
+    path("contacts/<uuid:contact_id>", ContactDetailView.as_view(), name="contacts-detail"),
 ]
