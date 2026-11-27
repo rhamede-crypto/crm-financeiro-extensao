@@ -17,6 +17,7 @@ from .views import (
     OpenAPIDocsView,
     OpenAPISchemaView,
     RegisterView,
+    RemindersView,
     SessionView,
 )
 
@@ -36,4 +37,5 @@ urlpatterns = [
     path("imports/<uuid:job_id>/cancel", ImportCancelView.as_view(), name="imports-cancel"),
     path("dashboard", DashboardView.as_view(), name="dashboard"),
     path("chat", ChatView.as_view(), name="chat"),
+    path("reminders", RemindersView.as_view(), name="reminders"),
 ]

@@ -8,7 +8,7 @@ from django.contrib.auth.models import PermissionsMixin
 from django.db import models
 
 from core.domain.exceptions import TenantAccessDeniedError
-from core.domain.value_objects import ImportStatus, ImportType
+from core.domain.value_objects import ImportStatus, ImportType, Weekday
 
 
 class UserManager(BaseUserManager["User"]):
@@ -232,6 +232,52 @@ class FinancialEntry(TenantScopedModel):
             models.Index(fields=["company", "entry_type", "reference"]),
             models.Index(fields=["company", "entry_type", "settled", "due_date"]),
             models.Index(fields=["company", "entry_date"]),
+        ]
+
+
+class ReminderPreference(models.Model):
+    WEEKDAY_CHOICES = [(item.value, item.value) for item in Weekday]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="reminder_preference",
+    )
+    enabled = models.BooleanField(default=False)
+    weekday = models.CharField(
+        max_length=16,
+        choices=WEEKDAY_CHOICES,
+        default=Weekday.MONDAY.value,
+    )
+    channel = models.CharField(max_length=32, default="email")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "reminder_preferences"
+
+
+class ReminderDispatchLog(TenantScopedModel):
+    STATUS_CHOICES = [
+        ("sent", "sent"),
+        ("failed", "failed"),
+        ("skipped_up_to_date", "skipped_up_to_date"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    iso_year = models.PositiveSmallIntegerField()
+    iso_week = models.PositiveSmallIntegerField()
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES)
+    detail = models.CharField(max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "reminder_dispatch_logs"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "iso_year", "iso_week"],
+                name="uniq_company_weekly_reminder",
+            ),
         ]
 
 
