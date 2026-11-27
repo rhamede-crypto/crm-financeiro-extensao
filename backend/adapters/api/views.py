@@ -9,6 +9,8 @@ import yaml
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.db import IntegrityError, transaction
+from django.db.models import F
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from drf_spectacular.utils import extend_schema
@@ -29,6 +31,8 @@ from adapters.persistence.models import (
     Company,
     CompanyMembership,
     Contact,
+    Deal,
+    DealTransitionLog,
     FinancialEntry,
     ImportJobRecord,
     ReminderPreference,
@@ -56,10 +60,12 @@ from core.domain.exceptions import (
 )
 from core.domain.value_objects import (
     CompanySegment,
+    DealStage,
     ImportStatus,
     MoneyDecimal,
     TaxRegime,
     normalize_ascii_text,
+    validate_deal_transition,
 )
 from core.ports.notifications import NotificationMessage
 from core.services.advisor import answer_financial_question
@@ -74,6 +80,7 @@ from .serializers import (
     CollectionPreviewSerializer,
     CollectionSendSerializer,
     CompanyOnboardingSerializer,
+    DealMoveSerializer,
     ImportConfirmSerializer,
     ImportCreateSerializer,
     ImportJobSerializer,
@@ -690,6 +697,24 @@ class CollectionSendView(APIView):
                 reason=receipt.reason,
                 sent_by=request.user,
             )
+            if receipt.status == "sent":
+                identified_deals = list(
+                    Deal.objects.for_company(request.company.id).filter(
+                        contact=contact,
+                        stage=DealStage.IDENTIFIED.value,
+                    )
+                )
+                for d in identified_deals:
+                    d.stage = DealStage.CONTACTED.value
+                    d.version += 1
+                    d.save(update_fields=["stage", "version", "updated_at"])
+                    DealTransitionLog.objects.create(
+                        company_id=request.company.id,
+                        deal=d,
+                        author=request.user,
+                        previous_stage=DealStage.IDENTIFIED.value,
+                        new_stage=DealStage.CONTACTED.value,
+                    )
             return status.HTTP_200_OK, {
                 "id": str(record.id),
                 "status": record.status,
@@ -704,3 +729,86 @@ class CollectionSendView(APIView):
             payload_signature={"tone": tone, "text": text, "channel": "email"},
             execute=dispatch,
         )
+
+
+def _deal_payload(deal: Deal) -> dict:
+    return {
+        "id": str(deal.id),
+        "contactId": str(deal.contact_id),
+        "title": deal.title,
+        "name": deal.contact.name,
+        "amount": f"{deal.amount:.2f}",
+        "due": deal.due_date.isoformat() if deal.due_date else None,
+        "stage": deal.stage,
+        "version": deal.version,
+        "transitions": [
+            {
+                "previousStage": log.previous_stage,
+                "newStage": log.new_stage,
+                "author": log.author.name if log.author else "Sistema",
+                "createdAt": log.created_at.isoformat(),
+            }
+            for log in deal.transitions.select_related("author").all()[:10]
+        ],
+    }
+
+
+class DealsCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        deals = (
+            Deal.objects.for_company(request.company.id)
+            .select_related("contact")
+            .prefetch_related("transitions__author")
+        )
+        return Response([_deal_payload(d) for d in deals], status=status.HTTP_200_OK)
+
+
+class DealDetailView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def patch(self, request: Request, deal_id: uuid.UUID) -> Response:
+        serializer = DealMoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        target_raw = serializer.validated_data["stage"]
+        expected_version = serializer.validated_data["version"]
+
+        with transaction.atomic():
+            deal = (
+                Deal.objects.for_company(request.company.id)
+                .select_for_update()
+                .select_related("contact")
+                .filter(id=deal_id)
+                .first()
+            )
+            if deal is None:
+                raise ResourceNotFoundError("Negociação indisponível.")
+            if deal.version != expected_version:
+                raise StateConflictError("O cartão mudou. O quadro foi recarregado.")
+            target_stage = validate_deal_transition(deal.stage, target_raw)
+            if deal.stage == target_stage.value:
+                return Response(_deal_payload(deal), status=status.HTTP_200_OK)
+
+            previous_stage = deal.stage
+            updated = (
+                Deal.objects.for_company(request.company.id)
+                .filter(id=deal.id, version=expected_version)
+                .update(
+                    stage=target_stage.value,
+                    version=F("version") + 1,
+                    updated_at=timezone.now(),
+                )
+            )
+            if updated != 1:
+                raise StateConflictError("O cartão mudou. O quadro foi recarregado.")
+
+            DealTransitionLog.objects.create(
+                company_id=request.company.id,
+                deal=deal,
+                author=request.user,
+                previous_stage=previous_stage,
+                new_stage=target_stage.value,
+            )
+            deal.refresh_from_db()
+            return Response(_deal_payload(deal), status=status.HTTP_200_OK)

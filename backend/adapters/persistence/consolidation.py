@@ -7,10 +7,17 @@ from typing import Any
 from django.db import transaction
 from django.utils import timezone
 
-from adapters.persistence.models import Company, Contact, FinancialEntry, ImportJobRecord
+from adapters.persistence.models import (
+    Company,
+    Contact,
+    Deal,
+    DealTransitionLog,
+    FinancialEntry,
+    ImportJobRecord,
+)
 from adapters.storage.local_storage import TenantLocalFileStorage
 from core.domain.exceptions import StateConflictError, ValidationDomainError
-from core.domain.value_objects import ImportStatus, normalize_ascii_text
+from core.domain.value_objects import DealStage, ImportStatus, normalize_ascii_text
 from core.services.contacts import (
     ContactCandidate,
     infer_contact_type,
@@ -354,6 +361,14 @@ def consolidate_import_job(
         locked_company.last_consolidated_at = timezone.now()
         locked_company.save(update_fields=["last_consolidated_at"])
 
+        if locked_job.import_type == "receivable":
+            _reconcile_receivable_deals(
+                company=locked_company,
+                created_entries=new_models if dedup.to_create else [],
+                updated_entries=updated_models if dedup.to_update else [],
+                actor=locked_job.created_by,
+            )
+
         locked_job.status = ImportStatus.COMPLETED.value
         locked_job.ambiguities_json = []
         locked_job.summary_json = dedup.summary
@@ -367,3 +382,71 @@ def consolidate_import_job(
             ]
         )
         return locked_job
+
+
+def _reconcile_receivable_deals(
+    *,
+    company: Company,
+    created_entries: list[FinancialEntry],
+    updated_entries: list[FinancialEntry],
+    actor,
+) -> None:
+    today = timezone.localdate()
+    touched = created_entries + updated_entries
+    entry_ids = [e.id for e in touched]
+    if not entry_ids:
+        return
+
+    existing_deals = {
+        d.financial_entry_id: d
+        for d in Deal.objects.for_company(company.id).filter(financial_entry_id__in=entry_ids)
+    }
+
+    deals_to_create: list[Deal] = []
+    deals_to_pay: list[Deal] = []
+    logs_to_create: list[DealTransitionLog] = []
+
+    for entry in touched:
+        deal = existing_deals.get(entry.id)
+        if not entry.settled:
+            open_bal = entry.amount - entry.paid_amount
+            if (
+                deal is None
+                and entry.contact_id is not None
+                and entry.due_date is not None
+                and entry.due_date < today
+                and open_bal > 0
+            ):
+                deals_to_create.append(
+                    Deal(
+                        company_id=company.id,
+                        contact_id=entry.contact_id,
+                        financial_entry=entry,
+                        title=entry.description[:160],
+                        amount=open_bal,
+                        due_date=entry.due_date,
+                        stage=DealStage.IDENTIFIED.value,
+                        version=1,
+                    )
+                )
+        elif deal is not None and deal.stage != DealStage.PAID.value:
+            prev_stage = deal.stage
+            deal.stage = DealStage.PAID.value
+            deal.version += 1
+            deals_to_pay.append(deal)
+            logs_to_create.append(
+                DealTransitionLog(
+                    company_id=company.id,
+                    deal=deal,
+                    author=actor,
+                    previous_stage=prev_stage,
+                    new_stage=DealStage.PAID.value,
+                )
+            )
+
+    if deals_to_create:
+        Deal.objects.bulk_create(deals_to_create, batch_size=500)
+    if deals_to_pay:
+        Deal.objects.bulk_update(deals_to_pay, ["stage", "version", "updated_at"], batch_size=500)
+    if logs_to_create:
+        DealTransitionLog.objects.bulk_create(logs_to_create, batch_size=500)

@@ -8,7 +8,7 @@ from django.contrib.auth.models import PermissionsMixin
 from django.db import models
 
 from core.domain.exceptions import TenantAccessDeniedError
-from core.domain.value_objects import ImportStatus, ImportType, Weekday
+from core.domain.value_objects import DealStage, ImportStatus, ImportType, Weekday
 
 
 class UserManager(BaseUserManager["User"]):
@@ -341,6 +341,65 @@ class CollectionDispatch(TenantScopedModel):
 
     class Meta:
         db_table = "collection_dispatches"
+        ordering = ["-created_at"]
+
+
+class Deal(TenantScopedModel):
+    STAGE_CHOICES = [(item.value, item.value) for item in DealStage]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="deals",
+    )
+    financial_entry = models.ForeignKey(
+        FinancialEntry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deals",
+    )
+    title = models.CharField(max_length=160)
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    due_date = models.DateField(null=True, blank=True)
+    stage = models.CharField(
+        max_length=24,
+        choices=STAGE_CHOICES,
+        default=DealStage.IDENTIFIED.value,
+    )
+    version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "deals"
+        ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["company", "stage"]),
+        ]
+
+
+class DealTransitionLog(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    deal = models.ForeignKey(
+        Deal,
+        on_delete=models.CASCADE,
+        related_name="transitions",
+    )
+    author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deal_transitions",
+    )
+    previous_stage = models.CharField(max_length=24)
+    new_stage = models.CharField(max_length=24)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "deal_transition_logs"
         ordering = ["-created_at"]
 
 

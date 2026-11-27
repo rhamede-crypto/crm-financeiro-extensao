@@ -6,7 +6,7 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 
-from .exceptions import ValidationDomainError
+from .exceptions import StateConflictError, ValidationDomainError
 
 TWO_PLACES = Decimal("0.01")
 
@@ -180,3 +180,24 @@ class TaxRegime(StrEnum):
                 fields={"taxRegime": ["Use simples_nacional, mei ou lucro_presumido."]},
             )
         return aliases[normalized]
+
+
+class DealStage(StrEnum):
+    IDENTIFIED = "identified"
+    CONTACTED = "contacted"
+    NEGOTIATING = "negotiating"
+    PROMISED = "promised"
+    PAID = "paid"
+
+
+def validate_deal_transition(current_stage: str, target_stage: str) -> DealStage:
+    try:
+        target = DealStage(target_stage)
+    except ValueError as exc:
+        raise ValidationDomainError(
+            "Etapa inválida.",
+            fields={"stage": ["Etapa de negociação desconhecida."]},
+        ) from exc
+    if current_stage == DealStage.PAID.value and target != DealStage.PAID:
+        raise StateConflictError("Negociação já encerrada como paga.")
+    return target
