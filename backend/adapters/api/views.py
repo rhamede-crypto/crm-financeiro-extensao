@@ -27,6 +27,7 @@ from adapters.persistence.models import (
     Company,
     CompanyMembership,
     ImportJobRecord,
+    ReminderPreference,
     StoredImportFile,
     User,
 )
@@ -63,6 +64,7 @@ from .serializers import (
     ImportJobSerializer,
     LoginSerializer,
     RegisterSerializer,
+    ReminderPreferencesSerializer,
 )
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
@@ -450,3 +452,35 @@ class ChatView(APIView):
             payload_signature={"question": question},
             execute=reply,
         )
+
+
+def _reminder_payload(company: Company, pref: ReminderPreference) -> dict:
+    available = bool(getattr(settings, "EMAIL_HOST", "").strip())
+    return {
+        "available": available,
+        "channel": "E-mail",
+        "enabled": pref.enabled,
+        "weekday": pref.weekday,
+        "lastConsolidated": company.last_consolidated_at.isoformat()
+        if company.last_consolidated_at
+        else None,
+    }
+
+
+class RemindersView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        pref, _ = ReminderPreference.objects.get_or_create(company=request.company)
+        return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)
+
+    def put(self, request: Request) -> Response:
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            raise StateConflictError("O canal está indisponível.")
+        serializer = ReminderPreferencesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pref, _ = ReminderPreference.objects.get_or_create(company=request.company)
+        pref.enabled = serializer.validated_data["enabled"]
+        pref.weekday = serializer.validated_data["weekday"]
+        pref.save(update_fields=["enabled", "weekday", "updated_at"])
+        return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)

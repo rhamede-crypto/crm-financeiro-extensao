@@ -2,19 +2,30 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from celery import shared_task
-from django.db import transaction
+from django.conf import settings
+from django.db import IntegrityError, transaction
 
 from adapters.ai.gateway import ResilientAIGateway
+from adapters.notifications.email_adapter import DjangoEmailNotificationAdapter
 from adapters.persistence.consolidation import consolidate_import_job
-from adapters.persistence.models import ImportJobRecord
+from adapters.persistence.models import (
+    CompanyMembership,
+    ImportJobRecord,
+    ReminderDispatchLog,
+    ReminderPreference,
+)
 from adapters.storage.local_storage import TenantLocalFileStorage
 from adapters.storage.spreadsheet_reader import read_spreadsheet_table
 from core.domain.exceptions import TenantAccessDeniedError, ValidationDomainError
 from core.domain.value_objects import ImportStatus
+from core.ports.notifications import NotificationMessage
 from core.services.etl import extract_table_preview, propose_column_mapping
+from core.services.reminders import evaluate_weekly_reminder
 
 
 @shared_task(bind=True, name="imports.verify_company_job_scope")
@@ -158,3 +169,100 @@ def process_import_job(self, company_id: str, job_id: str) -> dict[str, str]:
         job.processing_duration_ms = elapsed_ms
         job.save(update_fields=["status", "error_message", "processing_duration_ms", "updated_at"])
         return {"company_id": company_id, "job_id": job_id, "status": job.status}
+
+
+@shared_task(bind=True, name="reminders.dispatch_weekly_reminders")
+def dispatch_weekly_reminders(self, now_iso: str | None = None) -> dict[str, int]:
+    """Evaluates and sends weekly spreadsheet update reminders in configured TIME_ZONE."""
+    tz = ZoneInfo(settings.TIME_ZONE)
+    if now_iso:
+        parsed = datetime.fromisoformat(now_iso)
+        now_local = parsed.replace(tzinfo=tz) if parsed.tzinfo is None else parsed.astimezone(tz)
+    else:
+        now_local = datetime.now(tz)
+
+    counts = {"sent": 0, "skipped_up_to_date": 0, "failed": 0, "skipped": 0}
+    notifier = DjangoEmailNotificationAdapter()
+    import_url = f"{settings.FRONTEND_APP_URL}/importacoes"
+
+    prefs = ReminderPreference.objects.select_related("company").filter(enabled=True)
+    for pref in prefs:
+        company = pref.company
+        last_local = (
+            company.last_consolidated_at.astimezone(tz)
+            if company.last_consolidated_at is not None
+            else None
+        )
+        iso = now_local.isocalendar()
+        already_logged = ReminderDispatchLog.objects.for_company(company.id).filter(
+            iso_year=int(iso.year),
+            iso_week=int(iso.week),
+        ).exists()
+
+        decision = evaluate_weekly_reminder(
+            enabled=pref.enabled,
+            weekday=pref.weekday,
+            now_local=now_local,
+            last_consolidated_local=last_local,
+            already_logged_this_week=already_logged,
+        )
+        if decision.action == "skip":
+            counts["skipped"] += 1
+            continue
+
+        if decision.action == "skip_fresh":
+            try:
+                ReminderDispatchLog.objects.create(
+                    company_id=company.id,
+                    iso_year=decision.iso_year,
+                    iso_week=decision.iso_week,
+                    status="skipped_up_to_date",
+                    detail="consolidated_within_6_days",
+                )
+                counts["skipped_up_to_date"] += 1
+            except IntegrityError:
+                counts["skipped"] += 1
+            continue
+
+        owner = (
+            CompanyMembership.objects.select_related("user")
+            .filter(company_id=company.id)
+            .order_by("created_at")
+            .first()
+        )
+        if owner is None or not owner.user.email:
+            continue
+
+        try:
+            with transaction.atomic():
+                log_entry = ReminderDispatchLog.objects.create(
+                    company_id=company.id,
+                    iso_year=decision.iso_year,
+                    iso_week=decision.iso_week,
+                    status="sent",
+                )
+                receipt = notifier.send(
+                    NotificationMessage(
+                        company_id=company.id,
+                        recipient=owner.user.email,
+                        subject=f"Lembrete semanal: atualize a planilha de {company.name}",
+                        body=(
+                            f"Olá, {owner.user.name}.\n\n"
+                            "Hora de enviar a planilha semanal para manter suas projeções "
+                            "de caixa atualizadas.\n"
+                            f"Acesse: {import_url}\n"
+                        ),
+                        channel="email",
+                    )
+                )
+                if receipt.status != "sent":
+                    log_entry.status = "failed"
+                    log_entry.detail = receipt.reason[:200]
+                    log_entry.save(update_fields=["status", "detail"])
+                    counts["failed"] += 1
+                else:
+                    counts["sent"] += 1
+        except IntegrityError:
+            counts["skipped"] += 1
+
+    return counts

@@ -3,6 +3,7 @@ from __future__ import annotations
 from rest_framework import serializers
 
 from adapters.persistence.models import ImportJobRecord
+from core.domain.value_objects import Weekday
 
 
 class RegisterSerializer(serializers.Serializer):
@@ -113,3 +114,8 @@ class ChatRequestSerializer(serializers.Serializer):
         if not cleaned:
             raise serializers.ValidationError("Escreva uma pergunta.")
         return cleaned
+
+
+class ReminderPreferencesSerializer(serializers.Serializer):
+    enabled = serializers.BooleanField()
+    weekday = serializers.ChoiceField(choices=[item.value for item in Weekday])

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from celery.schedules import crontab
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -131,6 +133,12 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_ALWAYS_EAGER = _env_bool("CELERY_TASK_ALWAYS_EAGER", False)
+CELERY_BEAT_SCHEDULE = {
+    "weekly-import-reminders": {
+        "task": "reminders.dispatch_weekly_reminders",
+        "schedule": crontab(hour=9, minute=0),
+    },
+}
 
 EMAIL_BACKEND = os.environ.get(
     "EMAIL_BACKEND",
