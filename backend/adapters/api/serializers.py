@@ -6,6 +6,44 @@ from adapters.persistence.models import ImportJobRecord
 from core.domain.value_objects import ImportType
 
 
+class RegisterSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=120, trim_whitespace=True)
+    email = serializers.EmailField(max_length=254)
+    password = serializers.CharField(min_length=8, max_length=128, write_only=True)
+
+    def validate_name(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Informe seu nome.")
+        return cleaned
+
+    def validate_email(self, value: str) -> str:
+        return value.strip().lower()
+
+
+class LoginSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=254)
+    password = serializers.CharField(max_length=128, write_only=True)
+
+    def validate_email(self, value: str) -> str:
+        return value.strip().lower()
+
+
+class CompanyOnboardingSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=140, trim_whitespace=True)
+    segment = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+    taxRegime = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+    tax_regime = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
+    initialBalance = serializers.CharField(required=False, allow_blank=True, default="")
+    initial_balance = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_name(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Informe o nome da empresa.")
+        return cleaned
+
+
 class ImportJobSerializer(serializers.ModelSerializer):
     type = serializers.CharField(source="import_type", read_only=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)

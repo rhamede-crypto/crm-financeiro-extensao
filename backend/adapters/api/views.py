@@ -6,19 +6,27 @@ from pathlib import Path
 
 import yaml
 from django.conf import settings
+from django.contrib.auth import authenticate, login, logout
+from django.db import IntegrityError, transaction
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from drf_spectacular.utils import extend_schema
 from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework import renderers, serializers, status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from adapters.persistence.models import ImportJobRecord, StoredImportFile
+from adapters.persistence.models import (
+    Company,
+    CompanyMembership,
+    ImportJobRecord,
+    StoredImportFile,
+    User,
+)
 from adapters.persistence.probes import DatabaseHealthProbe
 from adapters.persistence.repositories import DjangoCompanyScopeRepository
 from adapters.queue.celery_dispatcher import ScopedCeleryDispatcher
@@ -29,13 +37,20 @@ from core.domain.exceptions import (
     PayloadTooLargeError,
     ResourceNotFoundError,
     StateConflictError,
+    ValidationDomainError,
 )
-from core.domain.value_objects import ImportStatus
+from core.domain.value_objects import CompanySegment, ImportStatus, MoneyDecimal, TaxRegime
 from core.services.health import HealthService
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
-from .serializers import ImportCreateSerializer, ImportJobSerializer
+from .serializers import (
+    CompanyOnboardingSerializer,
+    ImportCreateSerializer,
+    ImportJobSerializer,
+    LoginSerializer,
+    RegisterSerializer,
+)
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
 
@@ -110,6 +125,22 @@ class OpenAPIDocsView(SpectacularSwaggerView):
     url_name = "openapi-schema"
 
 
+def _session_payload(user: User) -> dict:
+    company = DjangoCompanyScopeRepository().get_company_for_user(user.id)
+    company_payload = None
+    if company is not None:
+        company_payload = {
+            "name": company.name,
+            "segment": company.segment,
+            "taxRegime": company.tax_regime,
+            "initialBalance": company.initial_balance.to_string(),
+        }
+    return {
+        "user": {"name": user.name, "email": user.email},
+        "company": company_payload,
+    }
+
+
 class SessionView(APIView):
     permission_classes = [AllowAny]
 
@@ -118,23 +149,117 @@ class SessionView(APIView):
         user = getattr(request, "user", None)
         if user is None or not user.is_authenticated:
             raise AuthenticationDomainError()
+        return Response(_session_payload(user), status=status.HTTP_200_OK)
 
-        company = DjangoCompanyScopeRepository().get_company_for_user(user.id)
-        company_payload = None
-        if company is not None:
-            company_payload = {
-                "name": company.name,
-                "segment": company.segment,
-                "taxRegime": company.tax_regime,
-                "initialBalance": company.initial_balance.to_string(),
-            }
-        return Response(
-            {
-                "user": {"name": user.name, "email": user.email},
-                "company": company_payload,
-            },
-            status=status.HTTP_200_OK,
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def post(self, request: Request) -> Response:
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if User.objects.filter(email=data["email"]).exists():
+            raise ValidationDomainError(
+                "Confira os dados do cadastro.",
+                fields={"email": ["E-mail já cadastrado."]},
+            )
+        try:
+            user = User.objects.create_user(
+                email=data["email"],
+                name=data["name"],
+                password=data["password"],
+            )
+        except IntegrityError as exc:
+            raise ValidationDomainError(
+                "Confira os dados do cadastro.",
+                fields={"email": ["E-mail já cadastrado."]},
+            ) from exc
+
+        login(request, user)
+        return Response(_session_payload(user), status=status.HTTP_201_CREATED)
+
+
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def post(self, request: Request) -> Response:
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        user = authenticate(request, username=data["email"], password=data["password"])
+        if user is None or not user.is_active:
+            raise AuthenticationDomainError(
+                "E-mail ou senha inválidos.",
+                code="invalid_credentials",
+            )
+        login(request, user)
+        return Response(_session_payload(user), status=status.HTTP_200_OK)
+
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        logout(request)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CompanyOnboardingView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        if CompanyMembership.objects.filter(user=request.user).exists():
+            raise StateConflictError("A empresa já está cadastrada.")
+
+        serializer = CompanyOnboardingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        segment = CompanySegment.parse(
+            data.get("segment"),
+            default=CompanySegment.COMERCIO_LOCAL,
         )
+        raw_regime = data.get("taxRegime") or data.get("tax_regime") or ""
+        tax_regime = TaxRegime.parse(raw_regime, default=TaxRegime.SIMPLES_NACIONAL)
+
+        raw_balance = request.data.get("initialBalance", request.data.get("initial_balance"))
+        if raw_balance in (None, ""):
+            initial_balance = MoneyDecimal.from_value("0.00")
+        elif isinstance(raw_balance, float):
+            raise ValidationDomainError(
+                "Saldo inicial inválido.",
+                fields={"initialBalance": ["Envie o saldo em texto decimal, como '1500.00'."]},
+            )
+        else:
+            try:
+                initial_balance = MoneyDecimal.from_value(str(raw_balance))
+            except ValidationDomainError as exc:
+                raise ValidationDomainError(
+                    "Saldo inicial inválido.",
+                    fields={"initialBalance": exc.fields.get("amount", ["Formato inválido."])},
+                ) from exc
+
+        with transaction.atomic():
+            if CompanyMembership.objects.filter(user=request.user).exists():
+                raise StateConflictError("A empresa já está cadastrada.")
+            company = Company.objects.create(
+                name=data["name"],
+                segment=segment.value,
+                tax_regime=tax_regime.value,
+                initial_balance=initial_balance.amount,
+            )
+            CompanyMembership.objects.create(
+                user=request.user,
+                company=company,
+                role="owner",
+            )
+
+        return Response(_session_payload(request.user), status=status.HTTP_201_CREATED)
 
 
 class ImportCollectionView(APIView):
