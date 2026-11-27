@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from django.conf import settings
 from django.utils import timezone
 
+from adapters.ai.gateway import ResilientAIGateway
 from adapters.persistence.models import Company, FinancialEntry
 from core.services.cashflow import CashflowEntry, project_cashflow
+from core.services.cost_anomalies import CostAnomalyEntry, detect_cost_anomalies
 from core.services.receivables import OverdueReceivableInput, rank_top_overdue_customers
 
 
@@ -59,6 +62,25 @@ def build_company_dashboard(
         min_30d_balance=min_30d_balance,
     )
 
+    cost_inputs = [
+        CostAnomalyEntry(
+            entry_type=e.entry_type,
+            entry_date=e.entry_date,
+            amount=e.amount,
+            description=e.description,
+            party_name=e.party_name,
+            normalized_party=e.normalized_party,
+            category=e.category,
+        )
+        for e in db_entries
+    ]
+    cost_result = detect_cost_anomalies(
+        entries=cost_inputs,
+        reference_date=ref_date,
+        threshold_pct=float(getattr(settings, "COST_ANOMALY_THRESHOLD_PCT", 12.0)),
+        ai_port=ResilientAIGateway(),
+    )
+
     return {
         "projections": cashflow.projections,
         "negativeDate": cashflow.negative_date,
@@ -69,5 +91,7 @@ def build_company_dashboard(
         if company.last_consolidated_at
         else None,
         "ranking": ranking,
-        "alerts": [],
+        "alerts": cost_result.alerts,
+        "costAlertsState": cost_result.state,
+        "costAlertsDetail": cost_result.detail,
     }
