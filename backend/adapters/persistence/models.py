@@ -8,7 +8,7 @@ from django.contrib.auth.models import PermissionsMixin
 from django.db import models
 
 from core.domain.exceptions import TenantAccessDeniedError
-from core.domain.value_objects import ImportStatus, ImportType, Weekday
+from core.domain.value_objects import DealStage, ImportStatus, ImportType, Weekday
 
 
 class UserManager(BaseUserManager["User"]):
@@ -191,6 +191,33 @@ class ImportJobRecord(TenantScopedModel):
         ]
 
 
+class Contact(TenantScopedModel):
+    TYPE_CHOICES = [("customer", "customer"), ("supplier", "supplier")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=160)
+    normalized_name = models.CharField(max_length=160)
+    contact_type = models.CharField(max_length=16, choices=TYPE_CHOICES)
+    document = models.CharField(max_length=32, blank=True, default="")
+    normalized_document = models.CharField(max_length=32, blank=True, default="")
+    phone = models.CharField(max_length=32, blank=True, default="")
+    normalized_phone = models.CharField(max_length=32, blank=True, default="")
+    email = models.EmailField(max_length=254, blank=True, default="")
+    needs_review = models.BooleanField(default=False)
+    review_reason = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "contacts"
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["company", "contact_type", "normalized_document"]),
+            models.Index(fields=["company", "contact_type", "normalized_phone"]),
+            models.Index(fields=["company", "contact_type", "normalized_name"]),
+        ]
+
+
 class FinancialEntry(TenantScopedModel):
     TYPE_CHOICES = [(item.value, item.value) for item in ImportType]
 
@@ -198,6 +225,13 @@ class FinancialEntry(TenantScopedModel):
     import_job = models.ForeignKey(
         ImportJobRecord,
         on_delete=models.PROTECT,
+        related_name="entries",
+    )
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="entries",
     )
     entry_type = models.CharField(max_length=24, choices=TYPE_CHOICES)
@@ -278,6 +312,161 @@ class ReminderDispatchLog(TenantScopedModel):
                 fields=["company", "iso_year", "iso_week"],
                 name="uniq_company_weekly_reminder",
             ),
+        ]
+
+
+class CollectionDispatch(TenantScopedModel):
+    STATUS_CHOICES = [("sent", "sent"), ("failed", "failed")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="collection_dispatches",
+    )
+    tone = models.CharField(max_length=24)
+    channel = models.CharField(max_length=32, default="email")
+    recipient = models.CharField(max_length=254)
+    message_text = models.TextField()
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES)
+    reason = models.CharField(max_length=200, blank=True, default="")
+    sent_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="collection_dispatches",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "collection_dispatches"
+        ordering = ["-created_at"]
+
+
+class Deal(TenantScopedModel):
+    STAGE_CHOICES = [(item.value, item.value) for item in DealStage]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="deals",
+    )
+    financial_entry = models.ForeignKey(
+        FinancialEntry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deals",
+    )
+    title = models.CharField(max_length=160)
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    due_date = models.DateField(null=True, blank=True)
+    stage = models.CharField(
+        max_length=24,
+        choices=STAGE_CHOICES,
+        default=DealStage.IDENTIFIED.value,
+    )
+    version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "deals"
+        ordering = ["-updated_at"]
+        indexes = [
+            models.Index(fields=["company", "stage"]),
+        ]
+
+
+class DealTransitionLog(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    deal = models.ForeignKey(
+        Deal,
+        on_delete=models.CASCADE,
+        related_name="transitions",
+    )
+    author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deal_transitions",
+    )
+    previous_stage = models.CharField(max_length=24)
+    new_stage = models.CharField(max_length=24)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "deal_transition_logs"
+        ordering = ["-created_at"]
+
+
+class SupplierAgreement(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="agreements",
+    )
+    agreement_date = models.DateField()
+    terms = models.TextField()
+    alert_id = models.CharField(max_length=120, blank=True, default="")
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supplier_agreements",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "supplier_agreements"
+        ordering = ["-created_at"]
+
+
+class TimelineEntry(TenantScopedModel):
+    KIND_NOTE = "note"
+    KIND_PROMISE = "promise"
+    KIND_CHOICES = [
+        (KIND_NOTE, "Nota"),
+        (KIND_PROMISE, "Promessa de pagamento"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="timeline_entries",
+    )
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    text = models.TextField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    entry_date = models.DateField(null=True, blank=True)
+    suggestion = models.JSONField(null=True, blank=True, default=None)
+    source_note = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="confirmed_promises",
+    )
+    author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="timeline_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "timeline_entries"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["company", "contact", "kind"]),
         ]
 
 

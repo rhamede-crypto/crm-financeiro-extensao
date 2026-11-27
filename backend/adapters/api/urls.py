@@ -4,8 +4,14 @@ from django.urls import path
 
 from .views import (
     ChatView,
+    CollectionPreviewView,
+    CollectionSendView,
     CompanyOnboardingView,
+    ContactDetailView,
+    ContactsCollectionView,
     DashboardView,
+    DealDetailView,
+    DealsCollectionView,
     HealthView,
     ImportCancelView,
     ImportCollectionView,
@@ -19,6 +25,10 @@ from .views import (
     RegisterView,
     RemindersView,
     SessionView,
+    SupplierAgreementCreateView,
+    TimelineCollectionView,
+    TimelineNoteCreateView,
+    TimelinePromiseConfirmView,
 )
 
 urlpatterns = [
@@ -38,4 +48,38 @@ urlpatterns = [
     path("dashboard", DashboardView.as_view(), name="dashboard"),
     path("chat", ChatView.as_view(), name="chat"),
     path("reminders", RemindersView.as_view(), name="reminders"),
+    path("contacts", ContactsCollectionView.as_view(), name="contacts-list"),
+    path("contacts/<uuid:contact_id>", ContactDetailView.as_view(), name="contacts-detail"),
+    path(
+        "contacts/<uuid:contact_id>/agreements",
+        SupplierAgreementCreateView.as_view(),
+        name="supplier-agreements",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline",
+        TimelineCollectionView.as_view(),
+        name="contact-timeline",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline/notes",
+        TimelineNoteCreateView.as_view(),
+        name="contact-timeline-notes",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline/<uuid:note_id>/confirm",
+        TimelinePromiseConfirmView.as_view(),
+        name="contact-timeline-confirm",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/collections/preview",
+        CollectionPreviewView.as_view(),
+        name="collections-preview",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/collections/send",
+        CollectionSendView.as_view(),
+        name="collections-send",
+    ),
+    path("deals", DealsCollectionView.as_view(), name="deals-list"),
+    path("deals/<uuid:deal_id>", DealDetailView.as_view(), name="deals-detail"),
 ]

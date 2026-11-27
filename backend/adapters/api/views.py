@@ -9,6 +9,8 @@ import yaml
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.db import IntegrityError, transaction
+from django.db.models import F
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from drf_spectacular.utils import extend_schema
@@ -21,14 +23,23 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from adapters.ai.gateway import ResilientAIGateway
+from adapters.notifications.email_adapter import DjangoEmailNotificationAdapter
 from adapters.persistence.consolidation import consolidate_import_job
 from adapters.persistence.dashboard_service import build_company_dashboard
 from adapters.persistence.models import (
+    CollectionDispatch,
     Company,
     CompanyMembership,
+    Contact,
+    Deal,
+    DealTransitionLog,
+    FinancialEntry,
     ImportJobRecord,
     ReminderPreference,
     StoredImportFile,
+    SupplierAgreement,
+    TimelineEntry,
     User,
 )
 from adapters.persistence.probes import DatabaseHealthProbe
@@ -50,21 +61,41 @@ from core.domain.exceptions import (
     StateConflictError,
     ValidationDomainError,
 )
-from core.domain.value_objects import CompanySegment, ImportStatus, MoneyDecimal, TaxRegime
+from core.domain.value_objects import (
+    CivilDate,
+    CompanySegment,
+    DealStage,
+    ImportStatus,
+    MoneyDecimal,
+    TaxRegime,
+    normalize_ascii_text,
+    validate_deal_transition,
+)
+from core.ports.notifications import NotificationMessage
 from core.services.advisor import answer_financial_question
+from core.services.collections import build_collection_message
+from core.services.customer_metrics import CustomerEntryInput, compute_customer_profile
 from core.services.health import HealthService
+from core.services.supplier_costs import SupplierCostEntry, build_supplier_cost_history
+from core.services.timeline import extract_promise_suggestion
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
 from .serializers import (
     ChatRequestSerializer,
+    CollectionPreviewSerializer,
+    CollectionSendSerializer,
     CompanyOnboardingSerializer,
+    DealMoveSerializer,
     ImportConfirmSerializer,
     ImportCreateSerializer,
     ImportJobSerializer,
     LoginSerializer,
     RegisterSerializer,
     ReminderPreferencesSerializer,
+    SupplierAgreementSerializer,
+    TimelineNoteCreateSerializer,
+    TimelinePromiseConfirmSerializer,
 )
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
@@ -484,3 +515,540 @@ class RemindersView(APIView):
         pref.weekday = serializer.validated_data["weekday"]
         pref.save(update_fields=["enabled", "weekday", "updated_at"])
         return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)
+
+
+class ContactsCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        query = normalize_ascii_text(request.query_params.get("query", ""))
+        ctype = request.query_params.get("type", "").strip()
+        qs = Contact.objects.for_company(request.company.id)
+        if ctype in {"customer", "supplier"}:
+            qs = qs.filter(contact_type=ctype)
+        if query:
+            qs = qs.filter(normalized_name__icontains=query)
+
+        payload = [
+            {
+                "id": str(contact.id),
+                "name": contact.name,
+                "type": contact.contact_type,
+                "needsReview": contact.needs_review,
+            }
+            for contact in qs
+        ]
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ContactDetailView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        payload = {
+            "id": str(contact.id),
+            "name": contact.name,
+            "type": contact.contact_type,
+            "document": contact.document,
+            "phone": contact.phone,
+            "email": contact.email,
+            "needsReview": contact.needs_review,
+            "reviewReason": contact.review_reason or None,
+            "invoices": [],
+            "history": [],
+            "costHistory": [],
+            "alerts": [],
+            "agreements": [],
+        }
+
+        if contact.contact_type == "customer":
+            db_entries = FinancialEntry.objects.for_company(request.company.id).filter(
+                contact=contact
+            )
+            profile = compute_customer_profile(
+                entries=[
+                    CustomerEntryInput(
+                        entry_id=e.reference or str(e.id),
+                        entry_date=e.entry_date,
+                        due_date=e.due_date,
+                        amount=e.amount,
+                        paid_amount=e.paid_amount,
+                        description=e.description,
+                        settled=e.settled,
+                    )
+                    for e in db_entries
+                ],
+                reference_date=timezone.localdate(),
+            )
+            payload.update(profile)
+        elif contact.contact_type == "supplier":
+            db_entries = FinancialEntry.objects.for_company(request.company.id).filter(
+                contact=contact
+            )
+            cost_data = build_supplier_cost_history(
+                [
+                    SupplierCostEntry(
+                        entry_date=e.entry_date,
+                        amount=e.amount,
+                        unit_name=e.unit_name,
+                        unit_price=e.unit_price,
+                    )
+                    for e in db_entries
+                ]
+            )
+            dashboard = build_company_dashboard(request.company)
+            supplier_alerts = [
+                alert
+                for alert in dashboard.get("alerts", [])
+                if alert.get("supplierId") == str(contact.id)
+                or normalize_ascii_text(alert.get("supplier")) == contact.normalized_name
+            ]
+            agreements = [
+                {
+                    "id": str(ag.id),
+                    "date": ag.agreement_date.isoformat(),
+                    "terms": ag.terms,
+                    "alertId": ag.alert_id or None,
+                }
+                for ag in SupplierAgreement.objects.for_company(request.company.id).filter(
+                    contact=contact
+                )
+            ]
+            payload.update(cost_data)
+            payload["alerts"] = supplier_alerts
+            payload["agreements"] = agreements
+
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class SupplierAgreementCreateView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+        if contact.contact_type != "supplier":
+            raise ValidationDomainError(
+                "Esta ficha não é de um fornecedor.",
+                fields={"contact": ["Acordos são permitidos apenas para fornecedores."]},
+            )
+
+        serializer = SupplierAgreementSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        agreement_date = CivilDate.from_iso(serializer.validated_data["date"]).value
+        alert_id = (serializer.validated_data.get("alertId") or "").strip()
+
+        agreement = SupplierAgreement.objects.create(
+            company_id=request.company.id,
+            contact=contact,
+            agreement_date=agreement_date,
+            terms=serializer.validated_data["terms"],
+            alert_id=alert_id,
+            created_by=request.user,
+        )
+        return Response(
+            {
+                "id": str(agreement.id),
+                "date": agreement.agreement_date.isoformat(),
+                "terms": agreement.terms,
+                "alertId": agreement.alert_id or None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+def _open_customer_invoices(company: Company, contact: Contact) -> list[dict]:
+    from django.utils import timezone
+
+    db_entries = FinancialEntry.objects.for_company(company.id).filter(contact=contact)
+    profile = compute_customer_profile(
+        entries=[
+            CustomerEntryInput(
+                entry_id=e.reference or str(e.id),
+                entry_date=e.entry_date,
+                due_date=e.due_date,
+                amount=e.amount,
+                paid_amount=e.paid_amount,
+                description=e.description,
+                settled=e.settled,
+            )
+            for e in db_entries
+        ],
+        reference_date=timezone.localdate(),
+    )
+    return profile["invoices"]
+
+
+class CollectionPreviewView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = CollectionPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tone = serializer.validated_data["tone"]
+
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            return Response(
+                {"available": False, "reason": "Canal de e-mail indisponível no momento."},
+                status=status.HTTP_200_OK,
+            )
+        if not contact.email.strip():
+            return Response(
+                {
+                    "available": False,
+                    "reason": "O cliente não possui e-mail cadastrado para cobrança.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        invoices = _open_customer_invoices(request.company, contact)
+        if not invoices:
+            return Response(
+                {"available": False, "reason": "O cliente não possui faturas em aberto."},
+                status=status.HTTP_200_OK,
+            )
+
+        text = build_collection_message(
+            tone=tone,
+            contact_name=contact.name,
+            company_name=request.company.name,
+            invoices=invoices,
+        )
+        return Response(
+            {
+                "available": True,
+                "channel": "E-mail",
+                "channelId": "email",
+                "recipient": contact.email,
+                "text": text,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class CollectionSendView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = CollectionSendSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tone = serializer.validated_data["tone"]
+        text = serializer.validated_data["text"]
+
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            raise StateConflictError("Canal de cobrança indisponível.")
+        if not contact.email.strip():
+            raise ValidationDomainError(
+                "Destinatário ausente para o cliente.",
+                fields={"recipient": ["Cadastre um e-mail para enviar cobrança."]},
+            )
+
+        def dispatch() -> tuple[int, dict]:
+            receipt = DjangoEmailNotificationAdapter().send(
+                NotificationMessage(
+                    company_id=request.company.id,
+                    recipient=contact.email,
+                    subject=f"Cobrança — {request.company.name}",
+                    body=text,
+                    channel="email",
+                )
+            )
+            record = CollectionDispatch.objects.create(
+                company_id=request.company.id,
+                contact=contact,
+                tone=tone,
+                channel="email",
+                recipient=contact.email,
+                message_text=text,
+                status=receipt.status,
+                reason=receipt.reason,
+                sent_by=request.user,
+            )
+            if receipt.status == "sent":
+                identified_deals = list(
+                    Deal.objects.for_company(request.company.id).filter(
+                        contact=contact,
+                        stage=DealStage.IDENTIFIED.value,
+                    )
+                )
+                for d in identified_deals:
+                    d.stage = DealStage.CONTACTED.value
+                    d.version += 1
+                    d.save(update_fields=["stage", "version", "updated_at"])
+                    DealTransitionLog.objects.create(
+                        company_id=request.company.id,
+                        deal=d,
+                        author=request.user,
+                        previous_stage=DealStage.IDENTIFIED.value,
+                        new_stage=DealStage.CONTACTED.value,
+                    )
+            return status.HTTP_200_OK, {
+                "id": str(record.id),
+                "status": record.status,
+                "channel": record.channel,
+                "reason": record.reason or None,
+            }
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/contacts/{contact_id}/collections/send",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"tone": tone, "text": text, "channel": "email"},
+            execute=dispatch,
+        )
+
+
+def _deal_payload(deal: Deal) -> dict:
+    return {
+        "id": str(deal.id),
+        "contactId": str(deal.contact_id),
+        "title": deal.title,
+        "name": deal.contact.name,
+        "amount": f"{deal.amount:.2f}",
+        "due": deal.due_date.isoformat() if deal.due_date else None,
+        "stage": deal.stage,
+        "version": deal.version,
+        "transitions": [
+            {
+                "previousStage": log.previous_stage,
+                "newStage": log.new_stage,
+                "author": log.author.name if log.author else "Sistema",
+                "createdAt": log.created_at.isoformat(),
+            }
+            for log in deal.transitions.select_related("author").all()[:10]
+        ],
+    }
+
+
+class DealsCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        deals = (
+            Deal.objects.for_company(request.company.id)
+            .select_related("contact")
+            .prefetch_related("transitions__author")
+        )
+        return Response([_deal_payload(d) for d in deals], status=status.HTTP_200_OK)
+
+
+class DealDetailView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def patch(self, request: Request, deal_id: uuid.UUID) -> Response:
+        serializer = DealMoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        target_raw = serializer.validated_data["stage"]
+        expected_version = serializer.validated_data["version"]
+
+        with transaction.atomic():
+            deal = (
+                Deal.objects.for_company(request.company.id)
+                .select_for_update()
+                .select_related("contact")
+                .filter(id=deal_id)
+                .first()
+            )
+            if deal is None:
+                raise ResourceNotFoundError("Negociação indisponível.")
+            if deal.version != expected_version:
+                raise StateConflictError("O cartão mudou. O quadro foi recarregado.")
+            target_stage = validate_deal_transition(deal.stage, target_raw)
+            if deal.stage == target_stage.value:
+                return Response(_deal_payload(deal), status=status.HTTP_200_OK)
+
+            previous_stage = deal.stage
+            updated = (
+                Deal.objects.for_company(request.company.id)
+                .filter(id=deal.id, version=expected_version)
+                .update(
+                    stage=target_stage.value,
+                    version=F("version") + 1,
+                    updated_at=timezone.now(),
+                )
+            )
+            if updated != 1:
+                raise StateConflictError("O cartão mudou. O quadro foi recarregado.")
+
+            DealTransitionLog.objects.create(
+                company_id=request.company.id,
+                deal=deal,
+                author=request.user,
+                previous_stage=previous_stage,
+                new_stage=target_stage.value,
+            )
+            deal.refresh_from_db()
+            return Response(_deal_payload(deal), status=status.HTTP_200_OK)
+
+
+def _timeline_entry_payload(entry: TimelineEntry) -> dict:
+    payload: dict = {
+        "id": str(entry.id),
+        "kind": entry.kind,
+        "text": entry.text,
+        "createdAt": entry.created_at.isoformat(),
+        "author": entry.author.name if entry.author else "Sistema",
+    }
+    if entry.entry_date is not None:
+        payload["date"] = entry.entry_date.isoformat()
+    if entry.amount is not None:
+        payload["amount"] = f"{entry.amount:.2f}"
+    if entry.kind == TimelineEntry.KIND_NOTE:
+        payload["suggestion"] = entry.suggestion
+    return payload
+
+
+class TimelineCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        entries = (
+            TimelineEntry.objects.for_company(request.company.id)
+            .filter(contact=contact)
+            .select_related("author")
+        )
+        items = [_timeline_entry_payload(entry) for entry in entries]
+
+        settled_payments = FinancialEntry.objects.for_company(request.company.id).filter(
+            contact=contact,
+            settled=True,
+        )
+        for payment in settled_payments:
+            items.append(
+                {
+                    "id": f"payment-{payment.id}",
+                    "kind": "payment",
+                    "date": payment.entry_date.isoformat(),
+                    "createdAt": f"{payment.entry_date.isoformat()}T12:00:00+00:00",
+                    "text": payment.description or "Pagamento realizado",
+                    "amount": f"{abs(payment.amount):.2f}",
+                }
+            )
+
+        items.sort(key=lambda item: (item["createdAt"], item["id"]))
+        return Response(items, status=status.HTTP_200_OK)
+
+
+class TimelineNoteCreateView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = TimelineNoteCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        text = serializer.validated_data["text"]
+
+        suggestion = extract_promise_suggestion(
+            text,
+            reference_date=timezone.localdate(),
+            ai_port=ResilientAIGateway(),
+        )
+        entry = TimelineEntry.objects.create(
+            company_id=request.company.id,
+            contact=contact,
+            kind=TimelineEntry.KIND_NOTE,
+            text=text,
+            suggestion=suggestion.to_dict() if suggestion is not None else None,
+            author=request.user,
+        )
+        return Response(_timeline_entry_payload(entry), status=status.HTTP_201_CREATED)
+
+
+class TimelinePromiseConfirmView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(
+        self,
+        request: Request,
+        contact_id: uuid.UUID,
+        note_id: uuid.UUID,
+    ) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = TimelinePromiseConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        title = serializer.validated_data["title"]
+        amount = serializer.validated_data["amount"]
+        promise_date = CivilDate.from_iso(serializer.validated_data["date"]).value
+
+        def confirm_promise() -> tuple[int, dict]:
+            with transaction.atomic():
+                note = (
+                    TimelineEntry.objects.for_company(request.company.id)
+                    .select_for_update()
+                    .select_related("author")
+                    .filter(id=note_id, contact=contact)
+                    .first()
+                )
+                if note is None:
+                    raise ResourceNotFoundError("Nota indisponível na timeline.")
+                if note.kind != TimelineEntry.KIND_NOTE or not note.suggestion:
+                    raise StateConflictError("A sugestão não está mais disponível.")
+
+                promise_entry = TimelineEntry.objects.create(
+                    company_id=request.company.id,
+                    contact=contact,
+                    kind=TimelineEntry.KIND_PROMISE,
+                    text=title,
+                    amount=amount,
+                    entry_date=promise_date,
+                    source_note=note,
+                    author=request.user,
+                )
+                note.suggestion = None
+                note.save(update_fields=["suggestion"])
+
+                if contact.contact_type == "customer":
+                    open_deals = list(
+                        Deal.objects.for_company(request.company.id)
+                        .filter(contact=contact)
+                        .exclude(stage__in=[DealStage.PAID.value, DealStage.PROMISED.value])
+                    )
+                    for deal in open_deals:
+                        previous_stage = deal.stage
+                        deal.stage = DealStage.PROMISED.value
+                        deal.version += 1
+                        deal.save(update_fields=["stage", "version", "updated_at"])
+                        DealTransitionLog.objects.create(
+                            company_id=request.company.id,
+                            deal=deal,
+                            author=request.user,
+                            previous_stage=previous_stage,
+                            new_stage=DealStage.PROMISED.value,
+                        )
+
+                return status.HTTP_201_CREATED, _timeline_entry_payload(promise_entry)
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/contacts/{contact_id}/timeline/{note_id}/confirm",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={
+                "title": title,
+                "amount": f"{amount:.2f}",
+                "date": promise_date.isoformat(),
+            },
+            execute=confirm_promise,
+        )
