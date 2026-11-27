@@ -427,6 +427,49 @@ class SupplierAgreement(TenantScopedModel):
         ordering = ["-created_at"]
 
 
+class TimelineEntry(TenantScopedModel):
+    KIND_NOTE = "note"
+    KIND_PROMISE = "promise"
+    KIND_CHOICES = [
+        (KIND_NOTE, "Nota"),
+        (KIND_PROMISE, "Promessa de pagamento"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="timeline_entries",
+    )
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    text = models.TextField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    entry_date = models.DateField(null=True, blank=True)
+    suggestion = models.JSONField(null=True, blank=True, default=None)
+    source_note = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="confirmed_promises",
+    )
+    author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="timeline_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "timeline_entries"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["company", "contact", "kind"]),
+        ]
+
+
 class IdempotencyRecord(TenantScopedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scope_path = models.CharField(max_length=200)

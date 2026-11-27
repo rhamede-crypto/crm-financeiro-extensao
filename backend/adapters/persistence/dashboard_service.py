@@ -7,8 +7,8 @@ from django.conf import settings
 from django.utils import timezone
 
 from adapters.ai.gateway import ResilientAIGateway
-from adapters.persistence.models import Company, FinancialEntry
-from core.services.cashflow import CashflowEntry, project_cashflow
+from adapters.persistence.models import Company, FinancialEntry, TimelineEntry
+from core.services.cashflow import CashflowEntry, ConfirmedPromise, project_cashflow
 from core.services.cost_anomalies import CostAnomalyEntry, detect_cost_anomalies
 from core.services.receivables import OverdueReceivableInput, rank_top_overdue_customers
 
@@ -33,10 +33,30 @@ def build_company_dashboard(
         )
         for e in db_entries
     ]
+    promise_rows = (
+        TimelineEntry.objects.for_company(company.id)
+        .filter(
+            kind=TimelineEntry.KIND_PROMISE,
+            contact__contact_type="customer",
+            entry_date__gte=ref_date,
+        )
+        .select_related("contact")
+    )
+    promises = [
+        ConfirmedPromise(
+            normalized_party=row.contact.normalized_name,
+            promise_date=row.entry_date,
+            amount=row.amount,
+            created_date=timezone.localdate(row.created_at),
+        )
+        for row in promise_rows
+        if row.entry_date is not None and row.amount is not None
+    ]
     cashflow = project_cashflow(
         initial_balance=company.initial_balance,
         entries=entries,
         reference_date=ref_date,
+        promises=promises,
     )
 
     min_30d_balance = (
@@ -96,4 +116,5 @@ def build_company_dashboard(
         "alerts": cost_result.alerts,
         "costAlertsState": cost_result.state,
         "costAlertsDetail": cost_result.detail,
+        "confirmedPromisesTotal": f"{cashflow.confirmed_promises_total:.2f}",
     }

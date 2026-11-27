@@ -166,3 +166,43 @@ class SupplierAgreementSerializer(serializers.Serializer):
         if not cleaned:
             raise serializers.ValidationError("Informe os termos.")
         return cleaned
+
+
+class TimelineNoteCreateSerializer(serializers.Serializer):
+    text = serializers.CharField(max_length=4000, trim_whitespace=True)
+
+    def validate_text(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Escreva uma nota.")
+        return cleaned
+
+
+class TimelinePromiseConfirmSerializer(serializers.Serializer):
+    title = serializers.CharField(max_length=160, trim_whitespace=True)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    date = serializers.CharField(max_length=20)
+
+    def validate_title(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Informe um título.")
+        return cleaned
+
+    def validate_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Informe um valor positivo.")
+        return value
+
+    def validate_date(self, value: str) -> str:
+        import re
+        from datetime import date as py_date
+
+        cleaned = value.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+            raise serializers.ValidationError("Informe uma data no formato YYYY-MM-DD.")
+        try:
+            py_date.fromisoformat(cleaned)
+        except ValueError as exc:
+            raise serializers.ValidationError("Data da promessa inválida.") from exc
+        return cleaned
