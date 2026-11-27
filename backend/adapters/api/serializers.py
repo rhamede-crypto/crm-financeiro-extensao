@@ -103,3 +103,13 @@ class ImportConfirmSerializer(serializers.Serializer):
         required=False,
         default=dict,
     )
+
+
+class ChatRequestSerializer(serializers.Serializer):
+    question = serializers.CharField(max_length=2000, trim_whitespace=True)
+
+    def validate_question(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Escreva uma pergunta.")
+        return cleaned
