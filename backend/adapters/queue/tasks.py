@@ -7,12 +7,13 @@ from uuid import UUID
 from celery import shared_task
 from django.db import transaction
 
+from adapters.ai.gateway import ResilientAIGateway
 from adapters.persistence.models import ImportJobRecord
 from adapters.storage.local_storage import TenantLocalFileStorage
 from adapters.storage.spreadsheet_reader import read_spreadsheet_table
 from core.domain.exceptions import TenantAccessDeniedError, ValidationDomainError
 from core.domain.value_objects import ImportStatus
-from core.services.etl import extract_table_preview
+from core.services.etl import extract_table_preview, propose_column_mapping
 
 
 @shared_task(bind=True, name="imports.verify_company_job_scope")
@@ -88,6 +89,11 @@ def process_import_job(self, company_id: str, job_id: str) -> dict[str, str]:
         raw_bytes = storage.read_bytes(parsed_company, relative_path)
         table = read_spreadsheet_table(job.filename, raw_bytes)
         preview_data = extract_table_preview(table)
+        proposal = propose_column_mapping(
+            table,
+            import_type=job.import_type,
+            ai_port=ResilientAIGateway(),
+        )
 
         parsed_rel = f"imports/{job.id}/parsed.json"
         parsed_key = storage.save_bytes(
@@ -105,8 +111,11 @@ def process_import_job(self, company_id: str, job_id: str) -> dict[str, str]:
             )
             if locked.status in {ImportStatus.COMPLETED.value, ImportStatus.CANCELED.value}:
                 return {"company_id": company_id, "job_id": job_id, "status": locked.status}
-            locked.columns_json = preview_data.columns
-            locked.preview_json = preview_data.preview
+            locked.columns_json = proposal.columns
+            locked.fields_json = proposal.fields
+            locked.mapping_json = proposal.mapping
+            locked.selected_mapping_json = proposal.selected_mapping
+            locked.preview_json = proposal.preview
             locked.row_count = len(preview_data.rows)
             locked.parsed_rows_storage_key = parsed_key
             locked.processing_duration_ms = elapsed_ms
@@ -115,6 +124,9 @@ def process_import_job(self, company_id: str, job_id: str) -> dict[str, str]:
             locked.save(
                 update_fields=[
                     "columns_json",
+                    "fields_json",
+                    "mapping_json",
+                    "selected_mapping_json",
                     "preview_json",
                     "row_count",
                     "parsed_rows_storage_key",
