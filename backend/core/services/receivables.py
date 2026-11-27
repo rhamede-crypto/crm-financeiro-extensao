@@ -16,6 +16,7 @@ class OverdueReceivableInput:
     amount: Decimal
     paid_amount: Decimal
     settled: bool
+    contact_id: str | None = None
 
 
 def rank_top_overdue_customers(
@@ -40,10 +41,11 @@ def rank_top_overdue_customers(
             continue
 
         days_overdue = (reference_date - item.due_date).days
-        bucket = grouped.get(item.normalized_party)
+        group_key = item.contact_id or item.normalized_party
+        bucket = grouped.get(group_key)
         if bucket is None:
-            grouped[item.normalized_party] = {
-                "id": f"contato-{item.normalized_party}",
+            grouped[group_key] = {
+                "id": item.contact_id or f"contato-{item.normalized_party}",
                 "name": item.party_name.strip() or item.normalized_party,
                 "normalized": item.normalized_party,
                 "total_open": open_amount,

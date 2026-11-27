@@ -48,6 +48,7 @@ class CostAnomalyEntry:
     party_name: str
     normalized_party: str
     category: str
+    contact_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +119,8 @@ def detect_cost_anomalies(
             category = categorize_expense(entry.description, entry.category)
             norm_supplier = entry.normalized_party or "fornecedor-nao-informado"
             supplier_label = entry.party_name.strip() or "Fornecedor não informado"
-            key = (category, norm_supplier)
+            supplier_ref = entry.contact_id or f"contato-{norm_supplier}-fornecedor"
+            key = (category, supplier_ref)
             target = costs_curr if is_curr else costs_prev
             if is_curr:
                 has_curr_costs = True
@@ -131,6 +133,7 @@ def detect_cost_anomalies(
                     "category": category,
                     "supplier": supplier_label,
                     "norm_supplier": norm_supplier,
+                    "supplier_id": supplier_ref,
                     "total": abs(entry.amount),
                 }
             else:
@@ -172,7 +175,7 @@ def detect_cost_anomalies(
         supplier_name = curr_data["supplier"]
         norm_supplier = curr_data["norm_supplier"]
         category = curr_data["category"]
-        supplier_id = f"contato-{norm_supplier}-fornecedor"
+        supplier_id = curr_data["supplier_id"]
 
         recommendation = _build_recommendation(
             ai_port=ai_port,
