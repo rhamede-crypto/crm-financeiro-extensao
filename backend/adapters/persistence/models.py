@@ -69,6 +69,7 @@ class Company(models.Model):
         decimal_places=2,
         default=Decimal("0.00"),
     )
+    last_consolidated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -167,6 +168,16 @@ class ImportJobRecord(TenantScopedModel):
     )
     error_message = models.TextField(blank=True, default="")
     row_count = models.PositiveIntegerField(null=True, blank=True)
+    upload_duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    processing_duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    columns_json = models.JSONField(default=list, blank=True)
+    fields_json = models.JSONField(default=list, blank=True)
+    mapping_json = models.JSONField(default=dict, blank=True)
+    selected_mapping_json = models.JSONField(default=dict, blank=True)
+    preview_json = models.JSONField(default=list, blank=True)
+    ambiguities_json = models.JSONField(default=list, blank=True)
+    summary_json = models.JSONField(null=True, blank=True)
+    parsed_rows_storage_key = models.CharField(max_length=512, blank=True, default="")
     last_worker_task_id = models.CharField(max_length=128, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
