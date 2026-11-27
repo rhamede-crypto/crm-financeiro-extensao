@@ -23,6 +23,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from adapters.ai.gateway import ResilientAIGateway
 from adapters.notifications.email_adapter import DjangoEmailNotificationAdapter
 from adapters.persistence.consolidation import consolidate_import_job
 from adapters.persistence.dashboard_service import build_company_dashboard
@@ -38,6 +39,7 @@ from adapters.persistence.models import (
     ReminderPreference,
     StoredImportFile,
     SupplierAgreement,
+    TimelineEntry,
     User,
 )
 from adapters.persistence.probes import DatabaseHealthProbe
@@ -75,6 +77,7 @@ from core.services.collections import build_collection_message
 from core.services.customer_metrics import CustomerEntryInput, compute_customer_profile
 from core.services.health import HealthService
 from core.services.supplier_costs import SupplierCostEntry, build_supplier_cost_history
+from core.services.timeline import extract_promise_suggestion
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
@@ -91,6 +94,8 @@ from .serializers import (
     RegisterSerializer,
     ReminderPreferencesSerializer,
     SupplierAgreementSerializer,
+    TimelineNoteCreateSerializer,
+    TimelinePromiseConfirmSerializer,
 )
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
@@ -887,3 +892,163 @@ class DealDetailView(APIView):
             )
             deal.refresh_from_db()
             return Response(_deal_payload(deal), status=status.HTTP_200_OK)
+
+
+def _timeline_entry_payload(entry: TimelineEntry) -> dict:
+    payload: dict = {
+        "id": str(entry.id),
+        "kind": entry.kind,
+        "text": entry.text,
+        "createdAt": entry.created_at.isoformat(),
+        "author": entry.author.name if entry.author else "Sistema",
+    }
+    if entry.entry_date is not None:
+        payload["date"] = entry.entry_date.isoformat()
+    if entry.amount is not None:
+        payload["amount"] = f"{entry.amount:.2f}"
+    if entry.kind == TimelineEntry.KIND_NOTE:
+        payload["suggestion"] = entry.suggestion
+    return payload
+
+
+class TimelineCollectionView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        entries = (
+            TimelineEntry.objects.for_company(request.company.id)
+            .filter(contact=contact)
+            .select_related("author")
+        )
+        items = [_timeline_entry_payload(entry) for entry in entries]
+
+        settled_payments = FinancialEntry.objects.for_company(request.company.id).filter(
+            contact=contact,
+            settled=True,
+        )
+        for payment in settled_payments:
+            items.append(
+                {
+                    "id": f"payment-{payment.id}",
+                    "kind": "payment",
+                    "date": payment.entry_date.isoformat(),
+                    "createdAt": f"{payment.entry_date.isoformat()}T12:00:00+00:00",
+                    "text": payment.description or "Pagamento realizado",
+                    "amount": f"{abs(payment.amount):.2f}",
+                }
+            )
+
+        items.sort(key=lambda item: (item["createdAt"], item["id"]))
+        return Response(items, status=status.HTTP_200_OK)
+
+
+class TimelineNoteCreateView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = TimelineNoteCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        text = serializer.validated_data["text"]
+
+        suggestion = extract_promise_suggestion(
+            text,
+            reference_date=timezone.localdate(),
+            ai_port=ResilientAIGateway(),
+        )
+        entry = TimelineEntry.objects.create(
+            company_id=request.company.id,
+            contact=contact,
+            kind=TimelineEntry.KIND_NOTE,
+            text=text,
+            suggestion=suggestion.to_dict() if suggestion is not None else None,
+            author=request.user,
+        )
+        return Response(_timeline_entry_payload(entry), status=status.HTTP_201_CREATED)
+
+
+class TimelinePromiseConfirmView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(
+        self,
+        request: Request,
+        contact_id: uuid.UUID,
+        note_id: uuid.UUID,
+    ) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+
+        serializer = TimelinePromiseConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        title = serializer.validated_data["title"]
+        amount = serializer.validated_data["amount"]
+        promise_date = CivilDate.from_iso(serializer.validated_data["date"]).value
+
+        def confirm_promise() -> tuple[int, dict]:
+            with transaction.atomic():
+                note = (
+                    TimelineEntry.objects.for_company(request.company.id)
+                    .select_for_update()
+                    .select_related("author")
+                    .filter(id=note_id, contact=contact)
+                    .first()
+                )
+                if note is None:
+                    raise ResourceNotFoundError("Nota indisponível na timeline.")
+                if note.kind != TimelineEntry.KIND_NOTE or not note.suggestion:
+                    raise StateConflictError("A sugestão não está mais disponível.")
+
+                promise_entry = TimelineEntry.objects.create(
+                    company_id=request.company.id,
+                    contact=contact,
+                    kind=TimelineEntry.KIND_PROMISE,
+                    text=title,
+                    amount=amount,
+                    entry_date=promise_date,
+                    source_note=note,
+                    author=request.user,
+                )
+                note.suggestion = None
+                note.save(update_fields=["suggestion"])
+
+                if contact.contact_type == "customer":
+                    open_deals = list(
+                        Deal.objects.for_company(request.company.id)
+                        .filter(contact=contact)
+                        .exclude(stage__in=[DealStage.PAID.value, DealStage.PROMISED.value])
+                    )
+                    for deal in open_deals:
+                        previous_stage = deal.stage
+                        deal.stage = DealStage.PROMISED.value
+                        deal.version += 1
+                        deal.save(update_fields=["stage", "version", "updated_at"])
+                        DealTransitionLog.objects.create(
+                            company_id=request.company.id,
+                            deal=deal,
+                            author=request.user,
+                            previous_stage=previous_stage,
+                            new_stage=DealStage.PROMISED.value,
+                        )
+
+                return status.HTTP_201_CREATED, _timeline_entry_payload(promise_entry)
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/contacts/{contact_id}/timeline/{note_id}/confirm",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={
+                "title": title,
+                "amount": f"{amount:.2f}",
+                "date": promise_date.isoformat(),
+            },
+            execute=confirm_promise,
+        )

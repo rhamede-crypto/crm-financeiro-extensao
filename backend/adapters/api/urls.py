@@ -26,6 +26,9 @@ from .views import (
     RemindersView,
     SessionView,
     SupplierAgreementCreateView,
+    TimelineCollectionView,
+    TimelineNoteCreateView,
+    TimelinePromiseConfirmView,
 )
 
 urlpatterns = [
@@ -51,6 +54,21 @@ urlpatterns = [
         "contacts/<uuid:contact_id>/agreements",
         SupplierAgreementCreateView.as_view(),
         name="supplier-agreements",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline",
+        TimelineCollectionView.as_view(),
+        name="contact-timeline",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline/notes",
+        TimelineNoteCreateView.as_view(),
+        name="contact-timeline-notes",
+    ),
+    path(
+        "contacts/<uuid:contact_id>/timeline/<uuid:note_id>/confirm",
+        TimelinePromiseConfirmView.as_view(),
+        name="contact-timeline-confirm",
     ),
     path(
         "contacts/<uuid:contact_id>/collections/preview",
