@@ -3,12 +3,24 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from core.domain.value_objects import normalize_ascii_text
 from core.ports.ai import AIRequest
 from core.services.privacy import PIISanitizer, sanitize_untrusted_text
+
+TWO_PLACES = Decimal("0.01")
+SETTLED_STATUS_TOKENS = {
+    "pago",
+    "recebido",
+    "baixado",
+    "quitado",
+    "paid",
+    "liquidado",
+    "efetivado",
+}
 
 CANONICAL_FIELDS: tuple[dict[str, Any], ...] = (
     {"id": "reference", "label": "Identificador de origem", "required": False},
@@ -108,7 +120,15 @@ APPROXIMATE_ALIASES: dict[str, tuple[str, ...]] = {
     "due": ("vencimento", "vencto", "vcto"),
 }
 
+AUX_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "category": ("categoria", "centro de custo", "grupo"),
+    "paid_amount": ("valor pago", "pago parcial", "valor baixado", "amortizado"),
+    "unit_name": ("unidade", "un", "unid"),
+    "unit_price": ("preco unitario", "valor unitario", "vlr unitario"),
+}
+
 DATE_CELL_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{4})$")
+LOCAL_DATE_RE = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +146,58 @@ class MappingProposalResult:
     selected_mapping: dict[str, str]
     preview: list[list[str]]
     needs_review: bool
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedRow:
+    row_index: int
+    entry_type: str
+    reference: str
+    entry_date: date
+    due_date: date | None
+    amount: Decimal
+    paid_amount: Decimal
+    description: str
+    normalized_description: str
+    party_name: str
+    normalized_party: str
+    category: str
+    unit_name: str
+    unit_price: Decimal | None
+    settled: bool
+
+    def equivalence_signature(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.entry_type,
+            self.entry_date.isoformat(),
+            f"{self.amount:.2f}",
+            self.normalized_description,
+            self.normalized_party,
+        )
+
+    def state_tuple(self) -> tuple[Any, ...]:
+        return (
+            self.entry_date,
+            self.due_date,
+            self.amount,
+            self.paid_amount,
+            self.description,
+            self.normalized_description,
+            self.party_name,
+            self.normalized_party,
+            self.category,
+            self.unit_name,
+            self.unit_price,
+            self.settled,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeduplicationResult:
+    to_create: list[NormalizedRow]
+    to_update: list[tuple[Any, NormalizedRow]]
+    ambiguities: list[dict[str, Any]]
+    summary: dict[str, int]
 
 
 def extract_table_preview(table: list[list[str]]) -> TablePreview:
@@ -157,14 +229,8 @@ def _looks_like_amount(samples: list[str]) -> bool:
         return False
     valid = 0
     for item in non_empty:
-        cleaned = item.strip().replace("R$", "").replace(" ", "")
-        if "," in cleaned:
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        try:
-            Decimal(cleaned)
+        if parse_money_decimal(item) is not None:
             valid += 1
-        except InvalidOperation:
-            pass
     return valid >= max(1, len(non_empty) // 2)
 
 
@@ -226,7 +292,6 @@ def propose_column_mapping(
 
         proposal[fid] = {"column": "", "confidence": "low"}
 
-    # Optional AI assistance for unmapped fields over minimized/masked headers
     missing_fields = [f["id"] for f in fields if not proposal[f["id"]]["column"]]
     if ai_port is not None and missing_fields:
         ai_suggestions = _query_ai_for_missing_columns(
@@ -316,3 +381,219 @@ def _query_ai_for_missing_columns(
     except Exception:
         return {}
     return {}
+
+
+def parse_civil_date(raw: Any) -> date | None:
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    local = LOCAL_DATE_RE.match(text)
+    if local:
+        day, month, year = int(local.group(1)), int(local.group(2)), int(local.group(3))
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+    iso_candidate = text[:10] if len(text) >= 10 else text
+    try:
+        return date.fromisoformat(iso_candidate)
+    except ValueError:
+        return None
+
+
+def parse_money_decimal(raw: Any) -> Decimal | None:
+    if isinstance(raw, Decimal):
+        if not raw.is_finite() or abs(raw) > Decimal("100000000.00"):
+            return None
+        return raw.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+    text = str(raw or "").strip().replace("R$", "").replace("r$", "").replace(" ", "")
+    if not text:
+        return None
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(".", "").replace(",", ".")
+
+    if not re.match(r"^-?\d+(\.\d{1,4})?$", text):
+        return None
+    try:
+        dec = Decimal(text).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return None
+    if not dec.is_finite() or abs(dec) > Decimal("100000000.00"):
+        return None
+    return dec
+
+
+def _detect_auxiliary_columns(columns: list[dict[str, str]]) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for col in columns:
+        cleaned = _clean_header(col["label"])
+        idx = int(col["id"])
+        for aux_key, aliases in AUX_COLUMN_ALIASES.items():
+            if aux_key not in found and cleaned in aliases:
+                found[aux_key] = idx
+    return found
+
+
+def _read_cell(row: list[str], col_id: str | int | None) -> str:
+    if col_id in (None, ""):
+        return ""
+    idx = int(col_id)
+    return str(row[idx]).strip() if 0 <= idx < len(row) else ""
+
+
+def normalize_mapped_rows(
+    *,
+    rows: list[list[str]],
+    columns: list[dict[str, str]],
+    mapping: dict[str, str],
+    import_type: str,
+) -> tuple[list[NormalizedRow], int]:
+    aux = _detect_auxiliary_columns(columns)
+    valid: list[NormalizedRow] = []
+    rejected = 0
+
+    for idx, row in enumerate(rows):
+        entry_date = parse_civil_date(_read_cell(row, mapping.get("date")))
+        amount = parse_money_decimal(_read_cell(row, mapping.get("amount")))
+        description = _read_cell(row, mapping.get("description"))[:255]
+        if entry_date is None or amount is None or not description:
+            rejected += 1
+            continue
+
+        reference = _read_cell(row, mapping.get("reference"))[:120]
+        due_date = parse_civil_date(_read_cell(row, mapping.get("due")))
+        party_name = _read_cell(row, mapping.get("party"))[:160]
+        status_norm = normalize_ascii_text(_read_cell(row, mapping.get("status")))
+        settled = status_norm in SETTLED_STATUS_TOKENS or import_type == "settled"
+
+        paid_raw = parse_money_decimal(_read_cell(row, aux.get("paid_amount")))
+        if settled:
+            paid_amount = abs(amount)
+        elif paid_raw is not None and paid_raw >= Decimal("0.00"):
+            paid_amount = min(abs(amount), paid_raw)
+        else:
+            paid_amount = Decimal("0.00")
+
+        category = _read_cell(row, aux.get("category"))[:80]
+        unit_name = _read_cell(row, aux.get("unit_name"))[:40]
+        unit_price = parse_money_decimal(_read_cell(row, aux.get("unit_price")))
+
+        valid.append(
+            NormalizedRow(
+                row_index=idx,
+                entry_type=import_type,
+                reference=reference,
+                entry_date=entry_date,
+                due_date=due_date,
+                amount=amount,
+                paid_amount=paid_amount,
+                description=description,
+                normalized_description=normalize_ascii_text(description)[:255],
+                party_name=party_name,
+                normalized_party=normalize_ascii_text(party_name)[:160],
+                category=category,
+                unit_name=unit_name,
+                unit_price=unit_price,
+                settled=settled,
+            )
+        )
+
+    return valid, rejected
+
+
+def deduplicate_entries(
+    *,
+    existing_records: list[dict[str, Any]],
+    incoming_rows: list[NormalizedRow],
+    rejected_count: int = 0,
+    resolutions: dict[str, str] | None = None,
+) -> DeduplicationResult:
+    """Idempotently deduplicates incoming rows against existing tenant ledger entries."""
+    res_map = resolutions or {}
+    by_reference: dict[tuple[str, str], dict[str, Any]] = {}
+    by_signature: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+
+    for raw_rec in existing_records:
+        rec = dict(raw_rec)
+        if rec["reference"]:
+            by_reference[(rec["entry_type"], rec["reference"])] = rec
+        by_signature.setdefault(rec["signature"], []).append(rec)
+
+    to_create: list[NormalizedRow] = []
+    updated_by_id: dict[Any, NormalizedRow] = {}
+    ambiguities: list[dict[str, Any]] = []
+    summary = {"created": 0, "updated": 0, "unchanged": 0, "rejected": rejected_count}
+
+    for item in incoming_rows:
+        sig = item.equivalence_signature()
+        if item.reference:
+            existing = by_reference.get((item.entry_type, item.reference))
+            if existing is None:
+                placeholder = {
+                    "id": None,
+                    "entry_type": item.entry_type,
+                    "reference": item.reference,
+                    "signature": sig,
+                    "state": item.state_tuple(),
+                }
+                by_reference[(item.entry_type, item.reference)] = placeholder
+                by_signature.setdefault(sig, []).append(placeholder)
+                to_create.append(item)
+                summary["created"] += 1
+            else:
+                if existing["state"] == item.state_tuple():
+                    summary["unchanged"] += 1
+                else:
+                    existing["state"] = item.state_tuple()
+                    if existing["id"] is not None:
+                        updated_by_id[existing["id"]] = item
+                    summary["updated"] += 1
+            continue
+
+        # No reference: check equivalence signature
+        matches = by_signature.get(sig, [])
+        if matches:
+            key = str(item.row_index)
+            decision = res_map.get(key)
+            if decision == "ignore":
+                summary["unchanged"] += 1
+                continue
+            if decision != "new":
+                ambiguities.append(
+                    {
+                        "id": key,
+                        "row": item.row_index + 2,
+                        "description": item.description,
+                        "options": ["new", "ignore"],
+                    }
+                )
+                continue
+
+        placeholder = {
+            "id": None,
+            "entry_type": item.entry_type,
+            "reference": "",
+            "signature": sig,
+            "state": item.state_tuple(),
+        }
+        by_signature.setdefault(sig, []).append(placeholder)
+        to_create.append(item)
+        summary["created"] += 1
+
+    to_update = [(obj_id, row) for obj_id, row in updated_by_id.items()]
+    return DeduplicationResult(
+        to_create=to_create,
+        to_update=to_update,
+        ambiguities=ambiguities,
+        summary=summary,
+    )

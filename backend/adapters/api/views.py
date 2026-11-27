@@ -21,6 +21,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from adapters.persistence.consolidation import consolidate_import_job
 from adapters.persistence.models import (
     Company,
     CompanyMembership,
@@ -54,6 +55,7 @@ from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
 from .serializers import (
     CompanyOnboardingSerializer,
+    ImportConfirmSerializer,
     ImportCreateSerializer,
     ImportJobSerializer,
     LoginSerializer,
@@ -362,6 +364,38 @@ class ImportDetailView(APIView):
         if job is None:
             raise ResourceNotFoundError("Importação não encontrada.")
         return Response(ImportJobSerializer(job).data, status=status.HTTP_200_OK)
+
+
+class ImportConfirmView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, job_id: uuid.UUID) -> Response:
+        serializer = ImportConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        mapping = serializer.validated_data["mapping"]
+        resolutions = serializer.validated_data.get("resolutions", {})
+
+        def confirm() -> tuple[int, dict]:
+            job = ImportJobRecord.objects.for_company(request.company.id).filter(id=job_id).first()
+            if job is None:
+                raise ResourceNotFoundError("Importação não encontrada.")
+            if job.status != ImportStatus.REVIEW.value:
+                raise StateConflictError("A importação já mudou de estado.")
+            updated = consolidate_import_job(
+                company=request.company,
+                job=job,
+                mapping=mapping,
+                resolutions=resolutions,
+            )
+            return status.HTTP_200_OK, ImportJobSerializer(updated).data
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/imports/{job_id}/confirm",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"mapping": mapping, "resolutions": resolutions},
+            execute=confirm,
+        )
 
 
 class ImportCancelView(APIView):
