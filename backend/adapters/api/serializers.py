@@ -148,3 +148,21 @@ class CollectionSendSerializer(serializers.Serializer):
 class DealMoveSerializer(serializers.Serializer):
     stage = serializers.CharField(max_length=24)
     version = serializers.IntegerField(min_value=1)
+
+
+class SupplierAgreementSerializer(serializers.Serializer):
+    date = serializers.CharField(max_length=20)
+    terms = serializers.CharField(max_length=3000, trim_whitespace=True)
+    alertId = serializers.CharField(
+        max_length=120,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        default="",
+    )
+
+    def validate_terms(self, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise serializers.ValidationError("Informe os termos.")
+        return cleaned

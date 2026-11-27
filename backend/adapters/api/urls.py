@@ -25,6 +25,7 @@ from .views import (
     RegisterView,
     RemindersView,
     SessionView,
+    SupplierAgreementCreateView,
 )
 
 urlpatterns = [
@@ -46,6 +47,11 @@ urlpatterns = [
     path("reminders", RemindersView.as_view(), name="reminders"),
     path("contacts", ContactsCollectionView.as_view(), name="contacts-list"),
     path("contacts/<uuid:contact_id>", ContactDetailView.as_view(), name="contacts-detail"),
+    path(
+        "contacts/<uuid:contact_id>/agreements",
+        SupplierAgreementCreateView.as_view(),
+        name="supplier-agreements",
+    ),
     path(
         "contacts/<uuid:contact_id>/collections/preview",
         CollectionPreviewView.as_view(),
