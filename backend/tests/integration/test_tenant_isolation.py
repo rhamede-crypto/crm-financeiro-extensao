@@ -96,7 +96,8 @@ def test_two_companies_cannot_list_read_edit_or_import_across_tenants(two_tenant
     )
     assert upload_a.status_code == 202
     job_a_id = upload_a.json()["id"]
-    assert upload_a.json()["status"] == "processing"
+    job_a_status = upload_a.json()["status"]
+    assert job_a_status in {"processing", "review", "completed"}
 
     # Retrying with the same Idempotency-Key replays the same result without duplicating jobs.
     replay_a = client_a.post(
@@ -129,7 +130,7 @@ def test_two_companies_cannot_list_read_edit_or_import_across_tenants(two_tenant
     # Empresa B cannot cancel/edit Empresa A's job even with the known UUID.
     cancel_b = client_b.post(f"/api/v1/imports/{job_a_id}/cancel")
     assert cancel_b.status_code == 404
-    assert ImportJobRecord.unscoped.get(id=job_a_id).status == "processing"
+    assert ImportJobRecord.unscoped.get(id=job_a_id).status == job_a_status
 
     # Empresa B cannot import on behalf of Empresa A by forging company_id in the payload.
     forged_upload = client_b.post(

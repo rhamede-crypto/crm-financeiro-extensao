@@ -96,7 +96,12 @@ Cada issue indica os requisitos atendidos, os critérios de aceite e os links da
 
 - No contrato REST, documentar autenticação, escopo de empresa, representação de dinheiro e datas, erros e estados de processamento. Manter exemplos sincronizados com os mocks do React.
 - Medir a meta de 80% com planilhas variadas, contando arquivos importados corretamente sem revisão humana sobre o total avaliado. Para arquivos de até 10.000 linhas, medir a meta de 30 segundos entre o aceite do upload e o resultado ou a solicitação de revisão. Registrar ambiente e amostra.
-- Documentar as premissas de recorrência, a política de deduplicação e as condições para disparar alertas. O back-end calcula os valores financeiros em código. A IA interpreta os dados e sugere ações.
+- **Premissas de recorrência, deduplicação e alertas (MVP)**:
+  - **Projeção de caixa (30/60/90 dias)**: saldo inicial + lançamentos liquidados até a data de referência + títulos em aberto futuros na data de vencimento + recorrências mensais detectadas em $\ge 2$ meses consecutivos anteriores somente quando não existir título correspondente já cadastrado no mês futuro (evitando dupla contagem).
+  - **Deduplicação**: usa `(entry_type, reference)` quando o identificador está presente (atualizando mudanças de status como `Aberto -> Pago`), ou envia colisões por assinatura `(tipo, data, valor, descrição, contato)` sem identificador para revisão manual (`new` / `ignore`).
+  - **Prioridade de cobrança (Top 5)**: agrega saldo vencido em aberto (considerando pagamentos parciais) e ordena pelo impacto na cobertura da necessidade de caixa em 30 dias (ou pelo saldo vencido total quando não há déficit), desempatando pelo vencimento mais recente.
+  - **Anomalias de custo**: compara variação bimestral por `(categoria, fornecedor)` em relação à variação da receita no mesmo intervalo usando limite padrão configurável de **12%** (`COST_ANOMALY_THRESHOLD_PCT=12.0`).
+  - **Lembrete semanal**: canal inicial por **E-mail** (SMTP Django + Mailpit em dev) agendado via Celery Beat em `America/Sao_Paulo`, com link para `/importacoes`, prevenção de envio duplicado na mesma semana ISO e dispensa automática quando a empresa consolidou planilha nos últimos 6 dias.
 - Usar planilhas sintéticas no desenvolvimento e na demonstração. Validar isolamento entre empresas, criptografia, minimização de dados e políticas de retenção antes de integrar um provedor de IA a dados reais.
 - Escolher o canal inicial dos lembretes e da cobrança dentro das issues correspondentes. Registrar na timeline as promessas confirmadas como previsões de recebimento separadas dos valores pagos.
 

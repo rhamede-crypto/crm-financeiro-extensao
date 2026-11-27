@@ -1,41 +1,71 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from pathlib import Path
 
 import yaml
 from django.conf import settings
+from django.contrib.auth import authenticate, login, logout
+from django.db import IntegrityError, transaction
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
 from drf_spectacular.utils import extend_schema
 from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework import renderers, serializers, status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from adapters.persistence.models import ImportJobRecord, StoredImportFile
+from adapters.persistence.consolidation import consolidate_import_job
+from adapters.persistence.dashboard_service import build_company_dashboard
+from adapters.persistence.models import (
+    Company,
+    CompanyMembership,
+    ImportJobRecord,
+    ReminderPreference,
+    StoredImportFile,
+    User,
+)
 from adapters.persistence.probes import DatabaseHealthProbe
 from adapters.persistence.repositories import DjangoCompanyScopeRepository
 from adapters.queue.celery_dispatcher import ScopedCeleryDispatcher
 from adapters.queue.probes import RedisBrokerHealthProbe
 from adapters.storage.local_storage import TenantLocalFileStorage
+from adapters.storage.spreadsheet_reader import (
+    MAX_DATA_ROWS,
+    MAX_UPLOAD_BYTES,
+    SUPPORTED_EXTENSIONS,
+    normalize_import_type,
+    read_spreadsheet_table,
+)
 from core.domain.exceptions import (
     AuthenticationDomainError,
     PayloadTooLargeError,
     ResourceNotFoundError,
     StateConflictError,
+    ValidationDomainError,
 )
-from core.domain.value_objects import ImportStatus
+from core.domain.value_objects import CompanySegment, ImportStatus, MoneyDecimal, TaxRegime
+from core.services.advisor import answer_financial_question
 from core.services.health import HealthService
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
-from .serializers import ImportCreateSerializer, ImportJobSerializer
+from .serializers import (
+    ChatRequestSerializer,
+    CompanyOnboardingSerializer,
+    ImportConfirmSerializer,
+    ImportCreateSerializer,
+    ImportJobSerializer,
+    LoginSerializer,
+    RegisterSerializer,
+    ReminderPreferencesSerializer,
+)
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
 
@@ -110,6 +140,22 @@ class OpenAPIDocsView(SpectacularSwaggerView):
     url_name = "openapi-schema"
 
 
+def _session_payload(user: User) -> dict:
+    company = DjangoCompanyScopeRepository().get_company_for_user(user.id)
+    company_payload = None
+    if company is not None:
+        company_payload = {
+            "name": company.name,
+            "segment": company.segment,
+            "taxRegime": company.tax_regime,
+            "initialBalance": company.initial_balance.to_string(),
+        }
+    return {
+        "user": {"name": user.name, "email": user.email},
+        "company": company_payload,
+    }
+
+
 class SessionView(APIView):
     permission_classes = [AllowAny]
 
@@ -118,20 +164,133 @@ class SessionView(APIView):
         user = getattr(request, "user", None)
         if user is None or not user.is_authenticated:
             raise AuthenticationDomainError()
+        return Response(_session_payload(user), status=status.HTTP_200_OK)
 
-        company = DjangoCompanyScopeRepository().get_company_for_user(user.id)
-        company_payload = None
-        if company is not None:
-            company_payload = {
-                "name": company.name,
-                "segment": company.segment,
-                "taxRegime": company.tax_regime,
-                "initialBalance": company.initial_balance.to_string(),
-            }
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def post(self, request: Request) -> Response:
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if User.objects.filter(email=data["email"]).exists():
+            raise ValidationDomainError(
+                "Confira os dados do cadastro.",
+                fields={"email": ["E-mail já cadastrado."]},
+            )
+        try:
+            user = User.objects.create_user(
+                email=data["email"],
+                name=data["name"],
+                password=data["password"],
+            )
+        except IntegrityError as exc:
+            raise ValidationDomainError(
+                "Confira os dados do cadastro.",
+                fields={"email": ["E-mail já cadastrado."]},
+            ) from exc
+
+        login(request, user)
+        return Response(_session_payload(user), status=status.HTTP_201_CREATED)
+
+
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def post(self, request: Request) -> Response:
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        user = authenticate(request, username=data["email"], password=data["password"])
+        if user is None or not user.is_active:
+            raise AuthenticationDomainError(
+                "E-mail ou senha inválidos.",
+                code="invalid_credentials",
+            )
+        login(request, user)
+        return Response(_session_payload(user), status=status.HTTP_200_OK)
+
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        logout(request)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CompanyOnboardingView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        if CompanyMembership.objects.filter(user=request.user).exists():
+            raise StateConflictError("A empresa já está cadastrada.")
+
+        serializer = CompanyOnboardingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        segment = CompanySegment.parse(
+            data.get("segment"),
+            default=CompanySegment.COMERCIO_LOCAL,
+        )
+        raw_regime = data.get("taxRegime") or data.get("tax_regime") or ""
+        tax_regime = TaxRegime.parse(raw_regime, default=TaxRegime.SIMPLES_NACIONAL)
+
+        raw_balance = request.data.get("initialBalance", request.data.get("initial_balance"))
+        if raw_balance in (None, ""):
+            initial_balance = MoneyDecimal.from_value("0.00")
+        elif isinstance(raw_balance, float):
+            raise ValidationDomainError(
+                "Saldo inicial inválido.",
+                fields={"initialBalance": ["Envie o saldo em texto decimal, como '1500.00'."]},
+            )
+        else:
+            try:
+                initial_balance = MoneyDecimal.from_value(str(raw_balance))
+            except ValidationDomainError as exc:
+                raise ValidationDomainError(
+                    "Saldo inicial inválido.",
+                    fields={"initialBalance": exc.fields.get("amount", ["Formato inválido."])},
+                ) from exc
+
+        with transaction.atomic():
+            if CompanyMembership.objects.filter(user=request.user).exists():
+                raise StateConflictError("A empresa já está cadastrada.")
+            company = Company.objects.create(
+                name=data["name"],
+                segment=segment.value,
+                tax_regime=tax_regime.value,
+                initial_balance=initial_balance.amount,
+            )
+            CompanyMembership.objects.create(
+                user=request.user,
+                company=company,
+                role="owner",
+            )
+
+        return Response(_session_payload(request.user), status=status.HTTP_201_CREATED)
+
+
+class ImportOptionsView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
         return Response(
             {
-                "user": {"name": user.name, "email": user.email},
-                "company": company_payload,
+                "maxBytes": MAX_UPLOAD_BYTES,
+                "maxRows": MAX_DATA_ROWS,
+                "extensions": list(SUPPORTED_EXTENSIONS),
+                "types": [
+                    {"id": "receivable", "label": "Contas a receber"},
+                    {"id": "payable", "label": "Contas a pagar"},
+                    {"id": "settled", "label": "Lançamentos efetivados"},
+                ],
             },
             status=status.HTTP_200_OK,
         )
@@ -146,15 +305,17 @@ class ImportCollectionView(APIView):
         return Response(ImportJobSerializer(jobs, many=True).data, status=status.HTTP_200_OK)
 
     def post(self, request: Request) -> Response:
+        upload_started = time.perf_counter()
         serializer = ImportCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         uploaded = serializer.validated_data["file"]
         raw_bytes = uploaded.read()
-        if not raw_bytes or len(raw_bytes) > 5 * 1024 * 1024:
+        if not raw_bytes or len(raw_bytes) > MAX_UPLOAD_BYTES:
             raise PayloadTooLargeError()
 
-        import_type = serializer.validated_data["type"]
+        import_type = normalize_import_type(serializer.validated_data["type"])
+        read_spreadsheet_table(uploaded.name, raw_bytes)
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
         def create_job() -> tuple[int, dict]:
@@ -172,6 +333,7 @@ class ImportCollectionView(APIView):
                 size_bytes=len(raw_bytes),
                 sha256=sha256,
             )
+            upload_duration_ms = max(1, int((time.perf_counter() - upload_started) * 1000))
             job = ImportJobRecord.objects.create(
                 id=job_id,
                 company_id=request.company.id,
@@ -180,9 +342,10 @@ class ImportCollectionView(APIView):
                 import_type=import_type,
                 filename=uploaded.name,
                 status=ImportStatus.QUEUED.value,
+                upload_duration_ms=upload_duration_ms,
             )
             ScopedCeleryDispatcher().enqueue_company_job(
-                "imports.verify_company_job_scope",
+                "imports.process_import_job",
                 request.company.id,
                 job.id,
             )
@@ -208,6 +371,38 @@ class ImportDetailView(APIView):
         return Response(ImportJobSerializer(job).data, status=status.HTTP_200_OK)
 
 
+class ImportConfirmView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, job_id: uuid.UUID) -> Response:
+        serializer = ImportConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        mapping = serializer.validated_data["mapping"]
+        resolutions = serializer.validated_data.get("resolutions", {})
+
+        def confirm() -> tuple[int, dict]:
+            job = ImportJobRecord.objects.for_company(request.company.id).filter(id=job_id).first()
+            if job is None:
+                raise ResourceNotFoundError("Importação não encontrada.")
+            if job.status != ImportStatus.REVIEW.value:
+                raise StateConflictError("A importação já mudou de estado.")
+            updated = consolidate_import_job(
+                company=request.company,
+                job=job,
+                mapping=mapping,
+                resolutions=resolutions,
+            )
+            return status.HTTP_200_OK, ImportJobSerializer(updated).data
+
+        return run_idempotent(
+            company=request.company,
+            scope_path=f"/imports/{job_id}/confirm",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"mapping": mapping, "resolutions": resolutions},
+            execute=confirm,
+        )
+
+
 class ImportCancelView(APIView):
     permission_classes = [HasCompanyScope]
 
@@ -224,3 +419,68 @@ class ImportCancelView(APIView):
         job.status = ImportStatus.CANCELED.value
         job.save(update_fields=["status", "updated_at"])
         return Response(ImportJobSerializer(job).data, status=status.HTTP_200_OK)
+
+
+class DashboardView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        return Response(build_company_dashboard(request.company), status=status.HTTP_200_OK)
+
+
+class ChatView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request) -> Response:
+        serializer = ChatRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        question = serializer.validated_data["question"]
+
+        def reply() -> tuple[int, dict]:
+            dashboard = build_company_dashboard(request.company)
+            answer = answer_financial_question(
+                question=question,
+                dashboard=dashboard,
+                company_name=request.company.name,
+            )
+            return status.HTTP_200_OK, answer
+
+        return run_idempotent(
+            company=request.company,
+            scope_path="/chat",
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            payload_signature={"question": question},
+            execute=reply,
+        )
+
+
+def _reminder_payload(company: Company, pref: ReminderPreference) -> dict:
+    available = bool(getattr(settings, "EMAIL_HOST", "").strip())
+    return {
+        "available": available,
+        "channel": "E-mail",
+        "enabled": pref.enabled,
+        "weekday": pref.weekday,
+        "lastConsolidated": company.last_consolidated_at.isoformat()
+        if company.last_consolidated_at
+        else None,
+    }
+
+
+class RemindersView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def get(self, request: Request) -> Response:
+        pref, _ = ReminderPreference.objects.get_or_create(company=request.company)
+        return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)
+
+    def put(self, request: Request) -> Response:
+        if not getattr(settings, "EMAIL_HOST", "").strip():
+            raise StateConflictError("O canal está indisponível.")
+        serializer = ReminderPreferencesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pref, _ = ReminderPreference.objects.get_or_create(company=request.company)
+        pref.enabled = serializer.validated_data["enabled"]
+        pref.weekday = serializer.validated_data["weekday"]
+        pref.save(update_fields=["enabled", "weekday", "updated_at"])
+        return Response(_reminder_payload(request.company, pref), status=status.HTTP_200_OK)

@@ -8,7 +8,7 @@ from django.contrib.auth.models import PermissionsMixin
 from django.db import models
 
 from core.domain.exceptions import TenantAccessDeniedError
-from core.domain.value_objects import ImportStatus, ImportType
+from core.domain.value_objects import ImportStatus, ImportType, Weekday
 
 
 class UserManager(BaseUserManager["User"]):
@@ -69,6 +69,7 @@ class Company(models.Model):
         decimal_places=2,
         default=Decimal("0.00"),
     )
+    last_consolidated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -167,6 +168,16 @@ class ImportJobRecord(TenantScopedModel):
     )
     error_message = models.TextField(blank=True, default="")
     row_count = models.PositiveIntegerField(null=True, blank=True)
+    upload_duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    processing_duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    columns_json = models.JSONField(default=list, blank=True)
+    fields_json = models.JSONField(default=list, blank=True)
+    mapping_json = models.JSONField(default=dict, blank=True)
+    selected_mapping_json = models.JSONField(default=dict, blank=True)
+    preview_json = models.JSONField(default=list, blank=True)
+    ambiguities_json = models.JSONField(default=list, blank=True)
+    summary_json = models.JSONField(null=True, blank=True)
+    parsed_rows_storage_key = models.CharField(max_length=512, blank=True, default="")
     last_worker_task_id = models.CharField(max_length=128, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -177,6 +188,96 @@ class ImportJobRecord(TenantScopedModel):
         indexes = [
             models.Index(fields=["company", "created_at"]),
             models.Index(fields=["company", "status"]),
+        ]
+
+
+class FinancialEntry(TenantScopedModel):
+    TYPE_CHOICES = [(item.value, item.value) for item in ImportType]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_job = models.ForeignKey(
+        ImportJobRecord,
+        on_delete=models.PROTECT,
+        related_name="entries",
+    )
+    entry_type = models.CharField(max_length=24, choices=TYPE_CHOICES)
+    reference = models.CharField(max_length=120, blank=True, default="")
+    entry_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    paid_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    description = models.CharField(max_length=255)
+    normalized_description = models.CharField(max_length=255)
+    party_name = models.CharField(max_length=160, blank=True, default="")
+    normalized_party = models.CharField(max_length=160, blank=True, default="")
+    category = models.CharField(max_length=80, blank=True, default="")
+    unit_name = models.CharField(max_length=40, blank=True, default="")
+    unit_price = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    settled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "financial_entries"
+        indexes = [
+            models.Index(fields=["company", "entry_type", "reference"]),
+            models.Index(fields=["company", "entry_type", "settled", "due_date"]),
+            models.Index(fields=["company", "entry_date"]),
+        ]
+
+
+class ReminderPreference(models.Model):
+    WEEKDAY_CHOICES = [(item.value, item.value) for item in Weekday]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="reminder_preference",
+    )
+    enabled = models.BooleanField(default=False)
+    weekday = models.CharField(
+        max_length=16,
+        choices=WEEKDAY_CHOICES,
+        default=Weekday.MONDAY.value,
+    )
+    channel = models.CharField(max_length=32, default="email")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "reminder_preferences"
+
+
+class ReminderDispatchLog(TenantScopedModel):
+    STATUS_CHOICES = [
+        ("sent", "sent"),
+        ("failed", "failed"),
+        ("skipped_up_to_date", "skipped_up_to_date"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    iso_year = models.PositiveSmallIntegerField()
+    iso_week = models.PositiveSmallIntegerField()
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES)
+    detail = models.CharField(max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "reminder_dispatch_logs"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "iso_year", "iso_week"],
+                name="uniq_company_weekly_reminder",
+            ),
         ]
 
 

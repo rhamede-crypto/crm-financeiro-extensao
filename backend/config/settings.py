@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from celery.schedules import crontab
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -115,6 +117,14 @@ CSRF_TRUSTED_ORIGINS = _env_list(
     "CSRF_TRUSTED_ORIGINS",
     "http://127.0.0.1:5173,http://localhost:5173",
 )
+if not DEBUG:
+    SECURE_SSL_REDIRECT = _env_bool("DJANGO_SECURE_SSL_REDIRECT", True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+FILE_ENCRYPTION_KEY = os.environ.get("FILE_ENCRYPTION_KEY", "")
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/1")
@@ -123,6 +133,12 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_ALWAYS_EAGER = _env_bool("CELERY_TASK_ALWAYS_EAGER", False)
+CELERY_BEAT_SCHEDULE = {
+    "weekly-import-reminders": {
+        "task": "reminders.dispatch_weekly_reminders",
+        "schedule": crontab(hour=9, minute=0),
+    },
+}
 
 EMAIL_BACKEND = os.environ.get(
     "EMAIL_BACKEND",
@@ -134,7 +150,13 @@ EMAIL_USE_TLS = _env_bool("EMAIL_USE_TLS", False)
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@crm-financeiro.local")
 
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "local")
+AI_EXTERNAL_API_URL = os.environ.get("AI_EXTERNAL_API_URL", "")
+AI_EXTERNAL_API_KEY = os.environ.get("AI_EXTERNAL_API_KEY", "")
+AI_EXTERNAL_MODEL = os.environ.get("AI_EXTERNAL_MODEL", "gemini-2.5-flash")
+AI_EXTERNAL_NON_TRAINING_APPROVED = _env_bool("AI_EXTERNAL_NON_TRAINING_APPROVED", False)
 AI_EXTERNAL_RETENTION_ZERO_APPROVED = _env_bool("AI_EXTERNAL_RETENTION_ZERO_APPROVED", False)
+COST_ANOMALY_THRESHOLD_PCT = float(os.environ.get("COST_ANOMALY_THRESHOLD_PCT", "12.0"))
+FRONTEND_APP_URL = os.environ.get("FRONTEND_APP_URL", "http://127.0.0.1:5173").rstrip("/")
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
@@ -158,6 +180,11 @@ SPECTACULAR_SETTINGS = {
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "sensitive_data": {
+            "()": "config.logging_filters.SensitiveDataLogFilter",
+        },
+    },
     "formatters": {
         "structured": {
             "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -167,6 +194,7 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "structured",
+            "filters": ["sensitive_data"],
         },
     },
     "root": {
