@@ -37,6 +37,7 @@ from adapters.persistence.models import (
     ImportJobRecord,
     ReminderPreference,
     StoredImportFile,
+    SupplierAgreement,
     User,
 )
 from adapters.persistence.probes import DatabaseHealthProbe
@@ -59,6 +60,7 @@ from core.domain.exceptions import (
     ValidationDomainError,
 )
 from core.domain.value_objects import (
+    CivilDate,
     CompanySegment,
     DealStage,
     ImportStatus,
@@ -72,6 +74,7 @@ from core.services.advisor import answer_financial_question
 from core.services.collections import build_collection_message
 from core.services.customer_metrics import CustomerEntryInput, compute_customer_profile
 from core.services.health import HealthService
+from core.services.supplier_costs import SupplierCostEntry, build_supplier_cost_history
 
 from .idempotency import run_idempotent, tenant_storage_path
 from .permissions import HasCompanyScope
@@ -87,6 +90,7 @@ from .serializers import (
     LoginSerializer,
     RegisterSerializer,
     ReminderPreferencesSerializer,
+    SupplierAgreementSerializer,
 )
 
 CONTRACT_PATH = Path(settings.BASE_DIR) / "contracts" / "openapi.v1.yaml"
@@ -557,8 +561,6 @@ class ContactDetailView(APIView):
         }
 
         if contact.contact_type == "customer":
-            from django.utils import timezone
-
             db_entries = FinancialEntry.objects.for_company(request.company.id).filter(
                 contact=contact
             )
@@ -578,8 +580,81 @@ class ContactDetailView(APIView):
                 reference_date=timezone.localdate(),
             )
             payload.update(profile)
+        elif contact.contact_type == "supplier":
+            db_entries = FinancialEntry.objects.for_company(request.company.id).filter(
+                contact=contact
+            )
+            cost_data = build_supplier_cost_history(
+                [
+                    SupplierCostEntry(
+                        entry_date=e.entry_date,
+                        amount=e.amount,
+                        unit_name=e.unit_name,
+                        unit_price=e.unit_price,
+                    )
+                    for e in db_entries
+                ]
+            )
+            dashboard = build_company_dashboard(request.company)
+            supplier_alerts = [
+                alert
+                for alert in dashboard.get("alerts", [])
+                if alert.get("supplierId") == str(contact.id)
+                or normalize_ascii_text(alert.get("supplier")) == contact.normalized_name
+            ]
+            agreements = [
+                {
+                    "id": str(ag.id),
+                    "date": ag.agreement_date.isoformat(),
+                    "terms": ag.terms,
+                    "alertId": ag.alert_id or None,
+                }
+                for ag in SupplierAgreement.objects.for_company(request.company.id).filter(
+                    contact=contact
+                )
+            ]
+            payload.update(cost_data)
+            payload["alerts"] = supplier_alerts
+            payload["agreements"] = agreements
 
         return Response(payload, status=status.HTTP_200_OK)
+
+
+class SupplierAgreementCreateView(APIView):
+    permission_classes = [HasCompanyScope]
+
+    def post(self, request: Request, contact_id: uuid.UUID) -> Response:
+        contact = Contact.objects.for_company(request.company.id).filter(id=contact_id).first()
+        if contact is None:
+            raise ResourceNotFoundError("Ficha indisponível.")
+        if contact.contact_type != "supplier":
+            raise ValidationDomainError(
+                "Esta ficha não é de um fornecedor.",
+                fields={"contact": ["Acordos são permitidos apenas para fornecedores."]},
+            )
+
+        serializer = SupplierAgreementSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        agreement_date = CivilDate.from_iso(serializer.validated_data["date"]).value
+        alert_id = (serializer.validated_data.get("alertId") or "").strip()
+
+        agreement = SupplierAgreement.objects.create(
+            company_id=request.company.id,
+            contact=contact,
+            agreement_date=agreement_date,
+            terms=serializer.validated_data["terms"],
+            alert_id=alert_id,
+            created_by=request.user,
+        )
+        return Response(
+            {
+                "id": str(agreement.id),
+                "date": agreement.agreement_date.isoformat(),
+                "terms": agreement.terms,
+                "alertId": agreement.alert_id or None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 def _open_customer_invoices(company: Company, contact: Contact) -> list[dict]:

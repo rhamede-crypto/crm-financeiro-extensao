@@ -403,6 +403,30 @@ class DealTransitionLog(TenantScopedModel):
         ordering = ["-created_at"]
 
 
+class SupplierAgreement(TenantScopedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.CASCADE,
+        related_name="agreements",
+    )
+    agreement_date = models.DateField()
+    terms = models.TextField()
+    alert_id = models.CharField(max_length=120, blank=True, default="")
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supplier_agreements",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "supplier_agreements"
+        ordering = ["-created_at"]
+
+
 class IdempotencyRecord(TenantScopedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scope_path = models.CharField(max_length=200)
