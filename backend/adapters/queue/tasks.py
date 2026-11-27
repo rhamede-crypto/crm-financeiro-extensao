@@ -8,6 +8,7 @@ from celery import shared_task
 from django.db import transaction
 
 from adapters.ai.gateway import ResilientAIGateway
+from adapters.persistence.consolidation import consolidate_import_job
 from adapters.persistence.models import ImportJobRecord
 from adapters.storage.local_storage import TenantLocalFileStorage
 from adapters.storage.spreadsheet_reader import read_spreadsheet_table
@@ -136,6 +137,19 @@ def process_import_job(self, company_id: str, job_id: str) -> dict[str, str]:
                     "updated_at",
                 ]
             )
+
+        if not proposal.needs_review:
+            job.refresh_from_db()
+            consolidated = consolidate_import_job(
+                company=job.company,
+                job=job,
+                mapping=proposal.selected_mapping,
+            )
+            return {
+                "company_id": company_id,
+                "job_id": job_id,
+                "status": consolidated.status,
+            }
         return {"company_id": company_id, "job_id": job_id, "status": ImportStatus.REVIEW.value}
     except ValidationDomainError as exc:
         elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))

@@ -94,3 +94,12 @@ class ImportJobSerializer(serializers.ModelSerializer):
 class ImportCreateSerializer(serializers.Serializer):
     type = serializers.CharField(max_length=32)
     file = serializers.FileField()
+
+
+class ImportConfirmSerializer(serializers.Serializer):
+    mapping = serializers.DictField(child=serializers.CharField(allow_blank=True))
+    resolutions = serializers.DictField(
+        child=serializers.ChoiceField(choices=["new", "ignore"]),
+        required=False,
+        default=dict,
+    )

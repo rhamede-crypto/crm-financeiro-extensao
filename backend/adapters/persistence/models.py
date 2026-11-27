@@ -191,6 +191,50 @@ class ImportJobRecord(TenantScopedModel):
         ]
 
 
+class FinancialEntry(TenantScopedModel):
+    TYPE_CHOICES = [(item.value, item.value) for item in ImportType]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_job = models.ForeignKey(
+        ImportJobRecord,
+        on_delete=models.PROTECT,
+        related_name="entries",
+    )
+    entry_type = models.CharField(max_length=24, choices=TYPE_CHOICES)
+    reference = models.CharField(max_length=120, blank=True, default="")
+    entry_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    paid_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    description = models.CharField(max_length=255)
+    normalized_description = models.CharField(max_length=255)
+    party_name = models.CharField(max_length=160, blank=True, default="")
+    normalized_party = models.CharField(max_length=160, blank=True, default="")
+    category = models.CharField(max_length=80, blank=True, default="")
+    unit_name = models.CharField(max_length=40, blank=True, default="")
+    unit_price = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    settled = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "financial_entries"
+        indexes = [
+            models.Index(fields=["company", "entry_type", "reference"]),
+            models.Index(fields=["company", "entry_type", "settled", "due_date"]),
+            models.Index(fields=["company", "entry_date"]),
+        ]
+
+
 class IdempotencyRecord(TenantScopedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     scope_path = models.CharField(max_length=200)

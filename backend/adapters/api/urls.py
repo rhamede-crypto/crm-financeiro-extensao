@@ -7,6 +7,7 @@ from .views import (
     HealthView,
     ImportCancelView,
     ImportCollectionView,
+    ImportConfirmView,
     ImportDetailView,
     ImportOptionsView,
     LoginView,
@@ -29,5 +30,6 @@ urlpatterns = [
     path("imports/options", ImportOptionsView.as_view(), name="imports-options"),
     path("imports", ImportCollectionView.as_view(), name="imports-list-create"),
     path("imports/<uuid:job_id>", ImportDetailView.as_view(), name="imports-detail"),
+    path("imports/<uuid:job_id>/confirm", ImportConfirmView.as_view(), name="imports-confirm"),
     path("imports/<uuid:job_id>/cancel", ImportCancelView.as_view(), name="imports-cancel"),
 ]
