@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from adapters.persistence.models import Company, FinancialEntry
 from core.services.cashflow import CashflowEntry, project_cashflow
+from core.services.receivables import OverdueReceivableInput, rank_top_overdue_customers
 
 
 def build_company_dashboard(
@@ -15,7 +16,7 @@ def build_company_dashboard(
     reference_date: date | None = None,
 ) -> dict[str, Any]:
     ref_date = reference_date or timezone.localdate()
-    entries_qs = FinancialEntry.objects.for_company(company.id)
+    db_entries = list(FinancialEntry.objects.for_company(company.id))
     entries = [
         CashflowEntry(
             entry_type=e.entry_type,
@@ -27,13 +28,37 @@ def build_company_dashboard(
             normalized_party=e.normalized_party,
             settled=e.settled,
         )
-        for e in entries_qs
+        for e in db_entries
     ]
     cashflow = project_cashflow(
         initial_balance=company.initial_balance,
         entries=entries,
         reference_date=ref_date,
     )
+
+    min_30d_balance = (
+        min(bal for _, bal in cashflow.daily_balances[:31])
+        if cashflow.daily_balances
+        else None
+    )
+    overdue_inputs = [
+        OverdueReceivableInput(
+            party_name=e.party_name,
+            normalized_party=e.normalized_party,
+            due_date=e.due_date,
+            amount=e.amount,
+            paid_amount=e.paid_amount,
+            settled=e.settled,
+        )
+        for e in db_entries
+        if e.entry_type == "receivable"
+    ]
+    ranking = rank_top_overdue_customers(
+        items=overdue_inputs,
+        reference_date=ref_date,
+        min_30d_balance=min_30d_balance,
+    )
+
     return {
         "projections": cashflow.projections,
         "negativeDate": cashflow.negative_date,
@@ -43,6 +68,6 @@ def build_company_dashboard(
         "updatedAt": company.last_consolidated_at.isoformat()
         if company.last_consolidated_at
         else None,
-        "ranking": [],
+        "ranking": ranking,
         "alerts": [],
     }
