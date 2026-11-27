@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -112,3 +113,70 @@ class Weekday(StrEnum):
     FRIDAY = "friday"
     SATURDAY = "saturday"
     SUNDAY = "sunday"
+
+
+def normalize_ascii_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    decomposed = unicodedata.normalize("NFD", text)
+    without_marks = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+    return " ".join(without_marks.lower().split())
+
+
+class CompanySegment(StrEnum):
+    BAR = "bar"
+    RESTAURANTE = "restaurante"
+    CLINICA = "clinica"
+    COMERCIO_LOCAL = "comercio_local"
+
+    @classmethod
+    def parse(cls, raw: str | None, *, default: CompanySegment | None = None) -> CompanySegment:
+        normalized = normalize_ascii_text(raw).replace("-", "_").replace(" ", "_")
+        aliases = {
+            "bar": cls.BAR,
+            "restaurante": cls.RESTAURANTE,
+            "clinica": cls.CLINICA,
+            "comercio": cls.COMERCIO_LOCAL,
+            "comercio_local": cls.COMERCIO_LOCAL,
+        }
+        if not normalized:
+            if default is not None:
+                return default
+            raise ValidationDomainError(
+                "Informe o segmento da empresa.",
+                fields={"segment": ["Selecione bar, restaurante, clínica ou comércio local."]},
+            )
+        if normalized not in aliases:
+            raise ValidationDomainError(
+                "Segmento inválido.",
+                fields={"segment": ["Use bar, restaurante, clínica ou comércio local."]},
+            )
+        return aliases[normalized]
+
+
+class TaxRegime(StrEnum):
+    SIMPLES_NACIONAL = "simples_nacional"
+    MEI = "mei"
+    LUCRO_PRESUMIDO = "lucro_presumido"
+
+    @classmethod
+    def parse(cls, raw: str | None, *, default: TaxRegime | None = None) -> TaxRegime:
+        normalized = normalize_ascii_text(raw).replace("-", "_").replace(" ", "_")
+        aliases = {
+            "simples": cls.SIMPLES_NACIONAL,
+            "simples_nacional": cls.SIMPLES_NACIONAL,
+            "mei": cls.MEI,
+            "lucro_presumido": cls.LUCRO_PRESUMIDO,
+        }
+        if not normalized:
+            if default is not None:
+                return default
+            raise ValidationDomainError(
+                "Informe o regime tributário.",
+                fields={"taxRegime": ["Use simples_nacional, mei ou lucro_presumido."]},
+            )
+        if normalized not in aliases:
+            raise ValidationDomainError(
+                "Regime tributário inválido.",
+                fields={"taxRegime": ["Use simples_nacional, mei ou lucro_presumido."]},
+            )
+        return aliases[normalized]
